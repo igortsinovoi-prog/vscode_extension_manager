@@ -113,12 +113,12 @@ function standardMockRunCommand(launchPath, args, timeoutSec) {
   }
 
   // The `code` CLI, either wrapped in `launchctl asuser <uid> <codePath> ...`
-  // (real target user) or invoked directly as VSCODE.codePath (root fallback).
+  // (real target user) or `env HOME=/var/root <codePath> ...` (root fallback).
   var codeArgs = null;
   if (launchPath === '/bin/launchctl' && args[0] === 'asuser') {
     codeArgs = args.slice(3);
-  } else if (launchPath === VSCODE.codePath) {
-    codeArgs = args;
+  } else if (launchPath === '/usr/bin/env' && args[1] === VSCODE.codePath) {
+    codeArgs = args.slice(2);
   }
 
   if (codeArgs) {
@@ -206,11 +206,11 @@ test('runCode: real uid -> wraps the command in launchctl asuser', function () {
   assertEqual(commandLog[0].args, ['asuser', '501', VSCODE.codePath, '--list-extensions', '--show-versions']);
 });
 
-test('runCode: null uid -> runs the code CLI directly (as root), no launchctl', function () {
+test('runCode: null uid -> runs the code CLI as root via env HOME=/var/root, no launchctl', function () {
   runCode(null, ['--list-extensions', '--show-versions']);
   assertEqual(commandLog.length, 1);
-  assertEqual(commandLog[0].launchPath, VSCODE.codePath);
-  assertEqual(commandLog[0].args, ['--list-extensions', '--show-versions']);
+  assertEqual(commandLog[0].launchPath, '/usr/bin/env');
+  assertEqual(commandLog[0].args, ['HOME=/var/root', VSCODE.codePath, '--list-extensions', '--show-versions']);
 });
 
 // ---------------------------------------------------------------------------

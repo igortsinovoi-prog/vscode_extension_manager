@@ -45,7 +45,10 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"  # js_scripts/
 EXT_ID="njpwerner.autodocstring"
 CODE_BIN="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
 DIST_SCRIPT="$DIR/dist/set-vscode-extension-version.js"
-REAL_USER="$(whoami)"
+# Under sudo, $(whoami) reports "root" (the effective user), not the account
+# whose ~/.vscode/extensions this check actually operates on - use
+# $SUDO_USER (the invoking account) when running under sudo.
+REAL_USER="${SUDO_USER:-$(whoami)}"
 if [[ "$EUID" -eq 0 ]]; then
   IS_ROOT=true
 else
@@ -322,7 +325,11 @@ echo "  envelope: $result"
 check "target_user is null" "$(field "$result" target_user)" "None"
 check "ran_as_root is true" "$(field "$result" ran_as_root)" "True"
 check "user_resolution_note is MISSING_EXTENSION_PATH" "$(field "$result" user_resolution_note)" "MISSING_EXTENSION_PATH"
-check "run still proceeds: action is already_correct_version" "$(field "$result" action)" "already_correct_version"
+# Root's own isolated identity (HOME=/var/root) has no VS Code extensions of
+# its own, regardless of what $REAL_USER has installed - so this genuinely
+# reports not_installed, not already_correct_version.
+check "run still proceeds: action is not_installed (root's own identity has no extensions installed)" \
+  "$(field "$result" action)" "not_installed"
 check "run still proceeds: status is skipped (not failure)" "$(field "$result" status)" "skipped"
 
 echo

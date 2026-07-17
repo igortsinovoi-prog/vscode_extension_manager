@@ -266,10 +266,20 @@ function resolveTargetUser(extensionPath, extId) {
 
 // Run the `code` CLI as the target user via launchctl asuser, so it reads/
 // writes that user's ~/.vscode/extensions - or, when uid is null (no
-// confidently-resolved account), directly as the current process (root).
+// confidently-resolved account), as root's own identity instead.
+//
+// The root-fallback case forces HOME=/var/root via `/usr/bin/env` rather
+// than just launching VSCODE.codePath directly: NSTask inherits this
+// process's ambient environment when none is given, and that environment's
+// HOME is not reliably root's own - e.g. a plain interactive `sudo` (as
+// opposed to `sudo -i`) commonly leaves the invoking user's HOME in place.
+// Without this override, "falls back to root" could silently operate on
+// whichever real user's ~/.vscode/extensions happens to be ambient, instead
+// of being isolated from any specific user as intended.
 function runCode(uid, args, timeoutSec) {
   if (uid === null) {
-    return _runCommand(VSCODE.codePath, args, timeoutSec);
+    var rootArgs = ['HOME=/var/root', VSCODE.codePath].concat(args);
+    return _runCommand('/usr/bin/env', rootArgs, timeoutSec);
   }
   var fullArgs = ['asuser', String(uid), VSCODE.codePath].concat(args);
   return _runCommand('/bin/launchctl', fullArgs, timeoutSec);
