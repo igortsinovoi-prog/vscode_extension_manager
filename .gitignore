@@ -1,0 +1,7 @@
+# Editor / OS cruft
+.DS_Store
+.vscode/
+.idea/
+
+# Build output (see js_scripts/build.sh)
+js_scripts/dist/
