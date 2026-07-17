@@ -1,0 +1,541 @@
+# =====================================================================
+# Glow Action Script - Set VS Code Extension Version (Windows, PowerShell) -
+# runner half.
+#
+# This file is the OS-interaction glue only: RTR contract (base64 in / JSON
+# envelope out), running the `code` CLI against the target user's extensions
+# folder, filesystem-level path safety checks, diagnostics. Every actual
+# DECISION (is this extension installed, does its version already match,
+# what should happen, which user does the given path belong to) lives in
+# Set-VSCodeExtensionVersion.Policy.ps1, which this file assumes is already
+# dot-sourced into scope - see ps_scripts/build.ps1, which concatenates that
+# file first, then this one, into the deployed
+# dist/Set-VSCodeExtensionVersion.ps1. Windows/PowerShell port of
+# set-vscode-extension-version-runner.js (macOS/JXA) - see that file for the
+# original design rationale this mirrors.
+#
+# Sets an installed VS Code extension to a specific version (upgrading or
+# downgrading as needed), or to the latest available version if no version
+# is given. Per spec: if the extension is NOT currently installed, this
+# script does nothing - it never installs an extension fresh.
+#
+#   - Not installed                       -> no-op.
+#   - Installed, no version given         -> `code --install-extension <id> --force`
+#     (no @version resolves and installs latest; `--upgrade-extension` is NOT
+#     a real flag on this CLI, same as the macOS side - see
+#     Invoke-VSCodeUpgradeToLatest).
+#   - Installed, version given, differs   -> `code --install-extension <id>@<version> --force`
+#     (this one command handles both upgrade and downgrade - it just forces
+#     the exact requested version, whichever direction that is from current).
+#   - Installed, version given, matches   -> no-op.
+#
+# Target user resolution: NOT "whoever is logged in" - the caller supplies
+# extension_path (the path to the extension's installed directory, or a file
+# within it, e.g. from a file watch on
+# <drive>:\Users\<user>\.vscode\extensions\<id>-<version>), and the target
+# user is extracted from that path. This is NEVER a hard failure:
+# Resolve-VSCodeTargetUser cannot abort the run. Whenever it can't
+# confidently resolve a real profile for the path (path missing/malformed,
+# doesn't match extension_id, fails the filesystem safety check, or names a
+# user with no such profile directory), it falls back to SYSTEM's own
+# (normally empty) extensions directory instead - and keeps whatever
+# username it DID manage to parse (if any) around in the envelope purely for
+# diagnostics, never as a reason to stop.
+#
+# Unlike the macOS side (which impersonates the target user via `launchctl
+# asuser` so `code` naturally reads/writes that user's ~/.vscode/extensions),
+# this script never impersonates anyone. VS Code's CLI supports
+# `--extensions-dir <dir>` to operate against an arbitrary extensions
+# folder directly - so instead of running `code` AS the target user, this
+# always runs it as whatever identity launched this script (typically
+# SYSTEM, under RTR), pointed explicitly at the resolved user's extensions
+# directory. This sidesteps Windows token-impersonation entirely, at the
+# cost of never actually running IN that user's session (fine here - the
+# CLI's extension install/list operations are pure filesystem + network, no
+# GUI/session dependency).
+#
+# RTR contract:
+#   - Input  : single base64-encoded JSON passed as the script's first
+#              positional argument.
+#   - Output : one compact JSON object on stdout (the ActionResult envelope).
+#   - Stderr : SILENT. All errors are reported inside the JSON envelope.
+#   - Diag   : file-only at C:\Windows\Temp\glow\rtr.txt. Never stderr.
+#
+# Local testing (no args uses safe defaults: dry_run=true):
+#   $json = '{"params":{"extension_id":"ms-python.python","version":"2024.1.0","extension_path":"C:\\Users\\jdoe\\.vscode\\extensions\\ms-python.python-2024.5.0"},"dry_run":true}'
+#   $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
+#   .\dist\Set-VSCodeExtensionVersion.ps1 $b64
+# =====================================================================
+
+# ===== Section 0: Constants =====
+
+$Script:ScriptVersion = 1
+$Script:OsFamily      = 'windows'
+$Script:DiagFile      = 'C:\Windows\Temp\glow\rtr.txt'
+
+$Script:DefaultCmdTimeoutSec = 20
+# Installing/upgrading an extension downloads a VSIX over the network - give
+# it much longer than a quick local command before we give up.
+$Script:InstallCmdTimeoutSec = 120
+
+# SYSTEM's own conventional profile-relative extensions path - the Windows
+# analogue of the macOS side's HOME=/var/root root-fallback isolation.
+# Normally empty (SYSTEM has no VS Code extensions of its own), which is
+# exactly the isolation guarantee the fallback is meant to provide: whenever
+# a real target user can't be confidently resolved, this script must never
+# silently operate on some OTHER real user's actual extensions.
+$Script:RootFallbackExtensionsDir = Join-Path $env:SystemRoot 'System32\config\systemprofile\.vscode\extensions'
+
+# ===== Section 1: Small Helpers =====
+
+function Get-VSCodeNowIso {
+  return [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+}
+
+function Write-VSCodeDiag {
+  param([string]$Message)
+  try {
+    $dir = Split-Path -Path $Script:DiagFile -Parent
+    if (-not (Test-Path -LiteralPath $dir)) {
+      New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $line = "[$(Get-VSCodeNowIso)] $Message`r`n"
+    Add-Content -LiteralPath $Script:DiagFile -Value $line -Encoding utf8 -ErrorAction Stop
+  } catch {
+    # never throw from diagnostics
+  }
+}
+
+function Get-VSCodeSerialNumber {
+  try {
+    $sn = (Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SerialNumber
+    if ($sn) { return $sn }
+  } catch {}
+  return ''
+}
+
+function Get-VSCodeOSMajorVersion {
+  try {
+    $v = [System.Environment]::OSVersion.Version
+    # Windows 10 and 11 both report major version 10 - Microsoft
+    # distinguishes them by build number (11 starts at 22000+).
+    if ($v.Major -eq 10 -and $v.Build -ge 22000) { return 11 }
+    if ($v.Major -gt 0) { return $v.Major }
+  } catch {}
+  Write-VSCodeDiag 'WARN: could not determine Windows version'
+  return 0
+}
+
+# ===== Section 2: Filesystem Helpers (single seams, mockable in tests) =====
+
+function Test-VSCodeFileExists {
+  param([string]$Path)
+  if (-not $Path) { return $false }
+  return Test-Path -LiteralPath $Path -PathType Leaf
+}
+
+function Test-VSCodeDirectoryExists {
+  param([string]$Path)
+  if (-not $Path) { return $false }
+  return Test-Path -LiteralPath $Path -PathType Container
+}
+
+# Resolves symlink/junction reparse points and standardizes the path, then
+# lets the caller re-parse the result and compare against the original
+# string-level parse - the same two-step defense as the macOS side's
+# resolveSafe: string-level parsing alone can be fooled by a symlinked path
+# component claiming to belong to one user while actually resolving
+# elsewhere on disk. Best-effort only: resolves the leaf's own reparse
+# point, not every ancestor directory in the chain (same caveat the macOS
+# original carries, just via a different OS API).
+function Resolve-VSCodeSafePath {
+  param([string]$Path)
+  if (-not $Path) { return $null }
+  if ($Path -match '[\x00-\x1f]') { return $null }
+  if ($Path.IndexOf('..') -ne -1) { return $null }
+  try {
+    $resolved = [System.IO.Path]::GetFullPath($Path)
+  } catch { return $null }
+  try {
+    $item = Get-Item -LiteralPath $resolved -Force -ErrorAction Stop
+    if ($item.LinkType -and $item.Target) {
+      $target = $item.Target | Select-Object -First 1
+      if (-not [System.IO.Path]::IsPathRooted($target)) {
+        $target = Join-Path (Split-Path $resolved -Parent) $target
+      }
+      $resolved = [System.IO.Path]::GetFullPath($target)
+    }
+  } catch {
+    # Path doesn't exist on disk (e.g. deleted between detection and this
+    # run) - fine, there's no live reparse point to be fooled by; fall
+    # through using the string-normalized path.
+  }
+  return $resolved
+}
+
+# ===== Section 3: Process Helper =====
+
+# Runs a command with a timeout, combining stdout+stderr into one string
+# (like shell's 2>&1) - same rationale as the macOS side's single-NSPipe
+# approach: simpler, and sidesteps any risk of a full stderr buffer
+# deadlocking a caller that's only draining stdout.
+function Invoke-VSCodeNativeCommand {
+  param(
+    [Parameter(Mandatory)][string]$FilePath,
+    [string[]]$ArgumentList = @(),
+    [int]$TimeoutSec = $Script:DefaultCmdTimeoutSec
+  )
+  try {
+    $launchPath = $FilePath
+    $launchArgs = $ArgumentList
+    # Process.Start with UseShellExecute=false (required below for
+    # stdout/stderr redirection) does NOT consult the registry file
+    # association that lets ShellExecute run .cmd/.bat files directly -
+    # CreateProcess needs an actual executable. code.cmd (VS Code's CLI
+    # entry point on Windows) is a batch file, so it must be launched via
+    # cmd.exe /c, never passed as FileName directly.
+    if ($FilePath -match '\.(cmd|bat)$') {
+      $launchPath = Join-Path $env:SystemRoot 'System32\cmd.exe'
+      # /d skips any registry AutoRun commands - mild hardening for a
+      # script that may run as SYSTEM.
+      $launchArgs = @('/d', '/c', $FilePath) + $ArgumentList
+    }
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $launchPath
+    foreach ($a in $launchArgs) { $psi.ArgumentList.Add($a) }
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.UseShellExecute        = $false
+    $psi.CreateNoWindow         = $true
+
+    $proc = [System.Diagnostics.Process]::new()
+    $proc.StartInfo = $psi
+
+    $outText = New-Object System.Text.StringBuilder
+    Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -Action {
+      if ($null -ne $EventArgs.Data) { $Event.MessageData.AppendLine($EventArgs.Data) | Out-Null }
+    } -MessageData $outText | Out-Null
+    Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -Action {
+      if ($null -ne $EventArgs.Data) { $Event.MessageData.AppendLine($EventArgs.Data) | Out-Null }
+    } -MessageData $outText | Out-Null
+
+    $proc.Start() | Out-Null
+    $proc.BeginOutputReadLine()
+    $proc.BeginErrorReadLine()
+
+    $exited = $proc.WaitForExit($TimeoutSec * 1000)
+    if (-not $exited) {
+      try { $proc.Kill($true) } catch {}
+    }
+    # Per .NET's own guidance for redirected-stream processes: call the
+    # parameterless overload after the timed one so the async output pump
+    # is guaranteed to finish flushing before Stdout/Stderr are read below -
+    # otherwise the last chunk of output can race the read.
+    $proc.WaitForExit()
+    Get-EventSubscriber | Where-Object { $_.SourceObject -eq $proc } | Unregister-Event
+
+    $combined = $outText.ToString()
+    return [PSCustomObject]@{ ExitCode = $proc.ExitCode; Stdout = $combined; Stderr = $combined }
+  } catch {
+    return [PSCustomObject]@{ ExitCode = -1; Stdout = ''; Stderr = [string]$_ }
+  }
+}
+
+# ===== Section 4: Target User Resolution (never aborts) =====
+
+# Combines the pure path-format validation (Get-VSCodeExtensionPathUser)
+# with a real filesystem safety check and a profile-directory existence
+# check, then decides the effective extensions directory to operate
+# against.
+#
+# This function ALWAYS returns something usable - it never signals "abort
+# the run". Whenever a real, resolvable profile can't be confidently
+# determined (path missing/malformed, doesn't match extension_id, fails the
+# safety check, or names a user with no such profile directory),
+# ExtensionsDir comes back pointed at SYSTEM's own isolated directory
+# instead. User reflects whatever username WAS parsed from the path, if any
+# - kept for diagnostics regardless of whether that profile actually exists.
+#
+# Returns @{ User = string|$null; ExtensionsDir = string; ResolutionNote = string|$null }.
+function Resolve-VSCodeTargetUser {
+  param([string]$ExtensionPath, [string]$ExtId)
+
+  $parsed = Get-VSCodeExtensionPathUser $ExtensionPath $ExtId
+  if (-not $parsed.Ok) {
+    return [PSCustomObject]@{ User = $null; ExtensionsDir = $Script:RootFallbackExtensionsDir; ResolutionNote = $parsed.Error }
+  }
+
+  $safePath = Resolve-VSCodeSafePath $ExtensionPath
+  $reparsed = if ($safePath) { Get-VSCodeExtensionPathUser $safePath $ExtId } else { $null }
+  if (-not $safePath -or -not $reparsed.Ok -or $reparsed.User -ne $parsed.User) {
+    Write-VSCodeDiag "WARN: extension_path failed filesystem safety check - falling back to SYSTEM's own extensions dir: $ExtensionPath"
+    return [PSCustomObject]@{ User = $parsed.User; ExtensionsDir = $Script:RootFallbackExtensionsDir; ResolutionNote = 'EXTENSION_PATH_UNSAFE' }
+  }
+
+  $userProfileDir = "C:\Users\$($parsed.User)"
+  if (-not (Test-VSCodeDirectoryExists $userProfileDir)) {
+    Write-VSCodeDiag "WARN: extension_path names user `"$($parsed.User)`" but no such profile directory exists - falling back to SYSTEM's own extensions dir"
+    return [PSCustomObject]@{ User = $parsed.User; ExtensionsDir = $Script:RootFallbackExtensionsDir; ResolutionNote = 'EXTENSION_PATH_USER_NOT_FOUND' }
+  }
+
+  $extensionsDir = Join-Path $userProfileDir '.vscode\extensions'
+  return [PSCustomObject]@{ User = $parsed.User; ExtensionsDir = $extensionsDir; ResolutionNote = $null }
+}
+
+# Locates code.cmd. Unlike the single fixed path on macOS, VS Code on
+# Windows can be installed system-wide (Program Files) or per-user
+# (LocalAppData) - checked in that order, since a system-wide install can
+# manage ANY user's --extensions-dir regardless of who's logged in, while a
+# per-user install only exists at all under that specific person's profile.
+# $TargetUser (if resolved) is checked last, as the fallback for a
+# machine where VS Code was only ever installed per-user by that person.
+function Find-VSCodeCli {
+  param([string]$TargetUser)
+
+  $candidates = New-Object System.Collections.Generic.List[string]
+  if ($env:ProgramFiles) {
+    $candidates.Add((Join-Path $env:ProgramFiles 'Microsoft VS Code\bin\code.cmd'))
+  }
+  $programFilesX86 = ${env:ProgramFiles(x86)}
+  if ($programFilesX86) {
+    $candidates.Add((Join-Path $programFilesX86 'Microsoft VS Code\bin\code.cmd'))
+  }
+  if ($env:LOCALAPPDATA) {
+    $candidates.Add((Join-Path $env:LOCALAPPDATA 'Programs\Microsoft VS Code\bin\code.cmd'))
+  }
+  if ($TargetUser) {
+    $candidates.Add("C:\Users\$TargetUser\AppData\Local\Programs\Microsoft VS Code\bin\code.cmd")
+  }
+
+  foreach ($candidate in $candidates) {
+    if (Test-VSCodeFileExists $candidate) { return $candidate }
+  }
+  return $null
+}
+
+# ===== Section 5: Extension Version Actions =====
+
+# Runs `code` pointed at $ExtensionsDir via --extensions-dir - this is the
+# one thing every CLI invocation in this script goes through, the Windows
+# analogue of the macOS side's runCode dispatch (launchctl asuser / root
+# fallback), just without ever changing process identity.
+function Invoke-VSCodeCli {
+  param([string]$CodePath, [string]$ExtensionsDir, [string[]]$Arguments, [int]$TimeoutSec)
+  $fullArgs = @('--extensions-dir', $ExtensionsDir) + $Arguments
+  return Invoke-VSCodeNativeCommand -FilePath $CodePath -ArgumentList $fullArgs -TimeoutSec $TimeoutSec
+}
+
+function Get-VSCodeInstalledExtensionsRaw {
+  param([string]$CodePath, [string]$ExtensionsDir)
+  return Invoke-VSCodeCli -CodePath $CodePath -ExtensionsDir $ExtensionsDir `
+    -Arguments @('--list-extensions', '--show-versions') -TimeoutSec $Script:DefaultCmdTimeoutSec
+}
+
+function Invoke-VSCodeUpgradeToLatest {
+  param([string]$CodePath, [string]$ExtensionsDir, [string]$ExtId, [bool]$DryRun)
+  if ($DryRun) { return [PSCustomObject]@{ Attempted = $false; DryRun = $true; Ok = $false; Stderr = '' } }
+  # `code --upgrade-extension <id>` is NOT a real flag on this CLI (same as
+  # the macOS side - verified against the same cross-platform Node CLI code)
+  # - installing by id with no @version and --force correctly resolves and
+  # installs latest instead.
+  $r = Invoke-VSCodeCli -CodePath $CodePath -ExtensionsDir $ExtensionsDir `
+    -Arguments @('--install-extension', $ExtId, '--force') -TimeoutSec $Script:InstallCmdTimeoutSec
+  return [PSCustomObject]@{
+    Attempted = $true
+    ExitCode  = $r.ExitCode
+    Ok        = ($r.ExitCode -eq 0)
+    Stdout    = if ($r.Stdout) { $r.Stdout.Trim() } else { '' }
+    Stderr    = if ($r.Stderr) { $r.Stderr.Trim() } else { '' }
+  }
+}
+
+function Invoke-VSCodeSetExactVersion {
+  param([string]$CodePath, [string]$ExtensionsDir, [string]$ExtId, [string]$Version, [bool]$DryRun)
+  if ($DryRun) { return [PSCustomObject]@{ Attempted = $false; DryRun = $true; Ok = $false; Stderr = '' } }
+  $r = Invoke-VSCodeCli -CodePath $CodePath -ExtensionsDir $ExtensionsDir `
+    -Arguments @('--install-extension', "$ExtId@$Version", '--force') -TimeoutSec $Script:InstallCmdTimeoutSec
+  return [PSCustomObject]@{
+    Attempted = $true
+    ExitCode  = $r.ExitCode
+    Ok        = ($r.ExitCode -eq 0)
+    Stdout    = if ($r.Stdout) { $r.Stdout.Trim() } else { '' }
+    Stderr    = if ($r.Stderr) { $r.Stderr.Trim() } else { '' }
+  }
+}
+
+# ===== Section 6: Input Decode & Main =====
+
+function Get-VSCodeProp {
+  param($Obj, [string]$Name, $Default)
+  if ($null -eq $Obj) { return $Default }
+  $prop = $Obj.PSObject.Properties[$Name]
+  if ($null -eq $prop -or $null -eq $prop.Value) { return $Default }
+  return $prop.Value
+}
+
+function ConvertTo-VSCodeBool {
+  param($Value, [bool]$Default)
+  if ($Value -is [bool]) { return $Value }
+  if ($Value -is [string]) { return $Value -eq 'true' }
+  return $Default
+}
+
+# Internal PowerShell objects use idiomatic PascalCase properties
+# (Attempted, ExitCode, Ok, Stderr...), but the RTR envelope's JSON schema
+# must match the macOS side's exact lowercase/snake_case field names
+# (attempted, exit_code, ok, stderr...) - ConvertTo-Json serializes
+# whatever case a property was constructed with, and PowerShell's
+# case-insensitive member access doesn't change that. This is the one
+# explicit translation point between internal convention and the wire
+# contract, rather than scattering snake_case names through internal
+# helpers.
+function ConvertTo-VSCodeCliResultJson {
+  param($ActionResult)
+  if (-not $ActionResult) { return $null }
+  if (-not $ActionResult.Attempted) {
+    return [PSCustomObject]@{ attempted = $false; dry_run = $true }
+  }
+  return [PSCustomObject]@{
+    attempted = $true
+    exit_code = $ActionResult.ExitCode
+    ok        = $ActionResult.Ok
+    stdout    = $ActionResult.Stdout
+    stderr    = $ActionResult.Stderr
+  }
+}
+
+function ConvertTo-VSCodeErrorJson {
+  param($ErrorResult)
+  if (-not $ErrorResult) { return $null }
+  return [PSCustomObject]@{
+    code    = $ErrorResult.Code
+    message = $ErrorResult.Message
+    stderr  = $ErrorResult.Stderr
+  }
+}
+
+function New-VSCodeFailureEnvelope {
+  param([string]$StartTime, [bool]$DryRun, [string]$Code, [string]$Message)
+  Write-VSCodeDiag "ERROR: ${Code}: $Message"
+  $envelope = [PSCustomObject]@{
+    os_family      = $Script:OsFamily
+    script_version = $Script:ScriptVersion
+    status         = 'failure'
+    changed        = $false
+    error          = [PSCustomObject]@{ code = $Code; message = $Message; stderr = '' }
+    dry_run        = $DryRun
+    start_time     = $StartTime
+    end_time       = (Get-VSCodeNowIso)
+    metadata       = [PSCustomObject]@{ hostname = $env:COMPUTERNAME; serial_number = '' }
+  }
+  return ($envelope | ConvertTo-Json -Compress -Depth 6)
+}
+
+function Invoke-SetVSCodeExtensionVersion {
+  param([string]$EncodedInput)
+
+  $startTime = Get-VSCodeNowIso
+  $dryRun = $true # safe default for bare local invocation
+
+  try {
+    $inputObj = $null
+    if ($EncodedInput) {
+      $bytes      = [Convert]::FromBase64String($EncodedInput)
+      $decodedRaw = [System.Text.Encoding]::UTF8.GetString($bytes)
+      $inputObj   = $decodedRaw | ConvertFrom-Json -ErrorAction Stop
+      $dryRun     = ConvertTo-VSCodeBool (Get-VSCodeProp $inputObj 'dry_run' $false) $false
+    }
+    $params = Get-VSCodeProp $inputObj 'params' ([PSCustomObject]@{})
+
+    $extId = Get-VSCodeProp $params 'extension_id' $null
+    $extId = if ($null -eq $extId) { '' } else { [string]$extId }
+    if (-not (Test-VSCodeExtensionId $extId)) {
+      return New-VSCodeFailureEnvelope $startTime $dryRun 'INVALID_PARAMS' 'invalid or missing extension_id (expected "<publisher>.<name>")'
+    }
+
+    $targetVersion = Get-VSCodeProp $params 'version' $null
+    if ($null -ne $targetVersion) { $targetVersion = [string]$targetVersion }
+    if (-not (Test-VSCodeExtensionVersion $targetVersion)) {
+      return New-VSCodeFailureEnvelope $startTime $dryRun 'INVALID_PARAMS' "invalid version: $targetVersion"
+    }
+
+    $extensionPath = Get-VSCodeProp $params 'extension_path' $null
+    $targetUser = Resolve-VSCodeTargetUser $extensionPath $extId # never aborts
+
+    $codePath = Find-VSCodeCli -TargetUser $targetUser.User
+    if (-not $codePath) {
+      return New-VSCodeFailureEnvelope $startTime $dryRun 'VSCODE_NOT_INSTALLED' 'code.cmd was not found in any known install location'
+    }
+
+    $osMajor = Get-VSCodeOSMajorVersion
+
+    $listResult = Get-VSCodeInstalledExtensionsRaw $codePath $targetUser.ExtensionsDir
+    if ($listResult.ExitCode -ne 0) {
+      $rawMsg = if ($listResult.Stderr) { $listResult.Stderr } elseif ($listResult.Stdout) { $listResult.Stdout } else { '' }
+      return New-VSCodeFailureEnvelope $startTime $dryRun 'LIST_EXTENSIONS_FAILED' "code --list-extensions failed: $($rawMsg.Trim())"
+    }
+    $installedBefore = ConvertFrom-VSCodeInstalledExtensionsList $listResult.Stdout
+    $decision = Get-VSCodeVersionAction $installedBefore $extId $targetVersion
+
+    $action = $null
+    $installedVersionAfter = $decision.InstalledVersion
+
+    switch ($decision.Action) {
+      'not_installed'           { } # per spec: never install fresh
+      'already_correct_version' { } # idempotent no-op
+      'set_version'              { $action = Invoke-VSCodeSetExactVersion $codePath $targetUser.ExtensionsDir $extId $targetVersion $dryRun }
+      'upgrade_to_latest'        { $action = Invoke-VSCodeUpgradeToLatest $codePath $targetUser.ExtensionsDir $extId $dryRun }
+    }
+
+    if ($action -and $action.Attempted -and $action.Ok) {
+      # Re-list to find out what version we actually ended up at, and
+      # whether anything really changed (relevant for upgrade_to_latest,
+      # where we couldn't know the target version in advance).
+      $listAfter = Get-VSCodeInstalledExtensionsRaw $codePath $targetUser.ExtensionsDir
+      if ($listAfter.ExitCode -eq 0) {
+        $installedAfter = ConvertFrom-VSCodeInstalledExtensionsList $listAfter.Stdout
+        $key = $extId.ToLowerInvariant()
+        $installedVersionAfter = if ($installedAfter.ContainsKey($key)) { $installedAfter[$key] } else { $null }
+      }
+    }
+
+    $outcome = Get-VSCodeRunOutcome $decision $action $installedVersionAfter $dryRun
+
+    $envelope = [PSCustomObject]@{
+      os_family                = $Script:OsFamily
+      script_version           = $Script:ScriptVersion
+      status                   = $outcome.Status
+      changed                  = $outcome.Changed
+      error                    = (ConvertTo-VSCodeErrorJson $outcome.Error)
+      dry_run                  = $dryRun
+      start_time                = $startTime
+      end_time                  = (Get-VSCodeNowIso)
+      metadata                  = [PSCustomObject]@{ hostname = $env:COMPUTERNAME; serial_number = (Get-VSCodeSerialNumber) }
+      extension_id               = $extId
+      target_version             = $targetVersion
+      extension_path             = $extensionPath
+      action                     = $decision.Action
+      installed_version_before   = $decision.InstalledVersion
+      installed_version_after    = $installedVersionAfter
+      target_user                = $targetUser.User
+      ran_as_root                = ($null -ne $targetUser.ResolutionNote)
+      user_resolution_note       = $targetUser.ResolutionNote
+      os_major_version           = $osMajor
+      cli_result                 = (ConvertTo-VSCodeCliResultJson $action)
+    }
+
+    $json = $envelope | ConvertTo-Json -Compress -Depth 6
+    Write-VSCodeDiag "RESULT: $json"
+    return $json
+  } catch {
+    return New-VSCodeFailureEnvelope $startTime $dryRun 'UNHANDLED_ERROR' $_.Exception.Message
+  }
+}
+
+# When run directly (not dot-sourced by Pester or concatenated into the
+# dist script's own invocation block), print the envelope to stdout - the
+# only thing this script ever writes there.
+if ($MyInvocation.InvocationName -ne '.') {
+  Invoke-SetVSCodeExtensionVersion -EncodedInput $args[0]
+}
