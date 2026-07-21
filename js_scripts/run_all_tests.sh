@@ -9,12 +9,13 @@
 #     report for them, only deliberate, comprehensive test design.
 #
 # Pass --with-real-world-test to also run
-# tests/real_world_check_set_vscode_extension_version.sh, which really
-# installs/downgrades/upgrades njpwerner.autodocstring on this machine (self
-# -cleaning: restores whatever state it found on exit). It rebuilds dist/
-# itself, so no separate build.sh step is needed first. It's opt-in since
-# it touches real machine state; run it with sudo for full coverage of the
-# root-fallback scenarios (it still runs without sudo, just skips those).
+# ../real_world_check_set_vscode_extension_version.sh --platform mac (shared
+# with the Windows/ps_scripts side), which really installs/downgrades/
+# upgrades njpwerner.autodocstring on this machine (self-cleaning: restores
+# whatever state it found on exit). It rebuilds dist/ itself, so no separate
+# build.sh step is needed first. It's opt-in since it touches real machine
+# state; run it with sudo for full coverage of the root-fallback scenarios
+# (it still runs without sudo, just skips those).
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,7 +78,7 @@ done
 if [[ "$WITH_REAL_WORLD_TEST" == true ]]; then
   echo
   echo "=== Real-world check: set-vscode-extension-version.js against njpwerner.autodocstring ==="
-  "$DIR/tests/real_world_check_set_vscode_extension_version.sh"
+  "$DIR/../real_world_check_set_vscode_extension_version.sh" --platform mac
 fi
 
 echo

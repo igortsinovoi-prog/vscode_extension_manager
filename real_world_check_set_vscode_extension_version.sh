@@ -1,12 +1,23 @@
 #!/bin/bash
 # Real end-to-end check against a real, small, well-known VS Code extension
-# (njpwerner.autodocstring - "Python Docstring Generator") on this machine,
-# running the actual built dist/set-vscode-extension-version.js via
-# osascript - not a mock. Not part of run_js_tests.sh (that's mocked and
-# safe to run anywhere); this one really installs/uninstalls a real
-# extension, so it's opt-in, manual, and self-cleaning: the extension's
-# original install state (present at some version, or absent) is captured
-# up front and restored on exit, regardless of pass/fail.
+# (njpwerner.autodocstring - "Python Docstring Generator"), running the
+# actual deployed set-vscode-extension-version script - not a mock. Shared
+# between js_scripts/ (macOS/JXA) and ps_scripts/ (Windows/PowerShell): the
+# scenario list and assertions below are identical across platforms - only
+# how each individual command actually runs differs, selected via
+# --platform. This script itself always runs as bash on the Mac; for
+# --platform windows-remote it drives a real Windows box over SSH rather
+# than requiring bash on Windows.
+#
+# Not part of either platform's mocked test suite (js_scripts/run_all_tests.sh
+# / ps_scripts/run_all_tests.ps1); this one really installs/uninstalls a
+# real extension, so it's opt-in, manual, and self-cleaning: the
+# extension's original install state (present at some version, or absent)
+# is captured up front and restored on exit, regardless of pass/fail.
+#
+# Usage:
+#   ./real_world_check_set_vscode_extension_version.sh --platform mac
+#   ./real_world_check_set_vscode_extension_version.sh --platform windows-remote --host <ip> --user <user> [--key <path>]
 #
 # Scenario 1: extension removed -> must no-op (never installs it fresh).
 # Scenario 2: extension present, requested version 0.4.0 -> must downgrade
@@ -18,8 +29,8 @@
 # Scenario 5: extension_path user resolution, both branches for real (not
 #             mocked): (a) a path naming the real current user resolves and
 #             runs as that user; (b) a path naming a nonexistent user falls
-#             back to running as root, WITHOUT touching the real user's
-#             actual extension state.
+#             back to the platform's isolated fallback identity, WITHOUT
+#             touching the real user's actual extension state.
 # Scenario 6: dry_run:true on a real pending change -> envelope says
 #             skipped/not changed AND the real installed version is
 #             independently confirmed unchanged afterward.
@@ -37,42 +48,92 @@
 # Scenario 13: extension_id passed in a different case than how VS Code's
 #              own --list-extensions reports it -> still resolves/matches
 #              correctly against the real installed-extensions list.
-# Scenario 14: extension_path is a real symlink escaping
-#              ~/.vscode/extensions -> EXTENSION_PATH_UNSAFE.
+# Scenario 14: extension_path is a real symlink escaping the extensions
+#              directory -> EXTENSION_PATH_UNSAFE.
 set -euo pipefail
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"  # js_scripts/
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXT_ID="njpwerner.autodocstring"
-CODE_BIN="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
-DIST_SCRIPT="$DIR/dist/set-vscode-extension-version.js"
-# Under sudo, $(whoami) reports "root" (the effective user), not the account
-# whose ~/.vscode/extensions this check actually operates on - use
-# $SUDO_USER (the invoking account) when running under sudo.
-REAL_USER="${SUDO_USER:-$(whoami)}"
-if [[ "$EUID" -eq 0 ]]; then
-  IS_ROOT=true
-else
-  IS_ROOT=false
-fi
-USER_EXTENSION_PATH="$HOME/.vscode/extensions/${EXT_ID}-0.0.0"  # shape only; leaf need not exist
-NO_SUCH_USER_PATH="/Users/glow_test_no_such_user/.vscode/extensions/${EXT_ID}-0.0.0"
-MISMATCHED_ID_PATH="$HOME/.vscode/extensions/some-other.extension-0.0.0"
-SYMLINK_TARGET="/tmp/glow_test_evil_target"
-SYMLINK_PATH="$HOME/.vscode/extensions/${EXT_ID}-9.9.9-symlinktest"
 
-if [[ ! -x "$CODE_BIN" ]]; then
-  echo "Error: VS Code CLI not found at $CODE_BIN" >&2
-  exit 1
-fi
+PLATFORM=""
+REMOTE_HOST=""
+REMOTE_USER=""
+REMOTE_KEY="$HOME/.ssh/utm_windows_vm"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --platform) PLATFORM="$2"; shift 2 ;;
+    --host) REMOTE_HOST="$2"; shift 2 ;;
+    --user) REMOTE_USER="$2"; shift 2 ;;
+    --key) REMOTE_KEY="$2"; shift 2 ;;
+    -h|--help)
+      echo "Usage: $0 --platform mac|windows-remote [--host H --user U --key K]"
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# ===== Platform dispatch =====
+#
+# Each platform branch below defines the same set of primitives the
+# scenario logic (further down) is written against:
+#   code_cli <args...>        - runs the real `code` CLI, prints stdout
+#   run_dist_script <payload> - invokes the deployed script under test with
+#                                a base64 RTR payload, prints its JSON envelope
+#   build_dist                 - (re)builds the deployed script from source
+#   EXT_PATH_PREFIX             - "<extensions-dir>", used to build
+#                                extension_path values in the right shape
+#   REAL_USER, IS_ROOT           - identity concepts scenario 5 depends on
+#   NO_SUCH_USER_PATH            - extension_path naming a nonexistent user
+case "$PLATFORM" in
+  mac)
+    CODE_BIN="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+    DIST_SCRIPT="$ROOT_DIR/js_scripts/dist/set-vscode-extension-version.js"
+    # Under sudo, $(whoami) reports "root" (the effective user), not the
+    # account whose ~/.vscode/extensions this check actually operates on -
+    # use $SUDO_USER (the invoking account) when running under sudo.
+    REAL_USER="${SUDO_USER:-$(whoami)}"
+    if [[ "$EUID" -eq 0 ]]; then IS_ROOT=true; else IS_ROOT=false; fi
+    EXT_PATH_PREFIX="$HOME/.vscode/extensions"
+    NO_SUCH_USER_PATH="/Users/glow_test_no_such_user/.vscode/extensions/${EXT_ID}-0.0.0"
+
+    if [[ ! -x "$CODE_BIN" ]]; then
+      echo "Error: VS Code CLI not found at $CODE_BIN" >&2
+      exit 1
+    fi
+
+    code_cli() { "$CODE_BIN" "$@"; }
+    run_dist_script() { osascript -l JavaScript "$DIST_SCRIPT" "$1"; }
+    build_dist() { "$ROOT_DIR/js_scripts/build.sh"; }
+    ;;
+  windows-remote)
+    echo "Error: --platform windows-remote isn't implemented yet - this is phase 1" >&2
+    echo "(rewrite + verify on mac first). Coming in a follow-up." >&2
+    exit 1
+    ;;
+  *)
+    echo "Error: --platform must be 'mac' or 'windows-remote'" >&2
+    exit 1
+    ;;
+esac
+
+MISMATCHED_ID_PATH="$EXT_PATH_PREFIX/some-other.extension-0.0.0"
+SYMLINK_TARGET="/tmp/glow_test_evil_target"
+SYMLINK_PATH="$EXT_PATH_PREFIX/${EXT_ID}-9.9.9-symlinktest"
+USER_EXTENSION_PATH="$EXT_PATH_PREFIX/${EXT_ID}-0.0.0"  # shape only; leaf need not exist
 
 get_installed_version() {
-  "$CODE_BIN" --list-extensions --show-versions 2>/dev/null \
+  code_cli --list-extensions --show-versions 2>/dev/null \
     | grep -i "^${EXT_ID}@" | sed -E "s/^[^@]+@//" || true
 }
 
 set_installed_version() {
   # $1 = exact version to force-install
-  "$CODE_BIN" --install-extension "${EXT_ID}@${1}" --force >/dev/null 2>&1
+  code_cli --install-extension "${EXT_ID}@${1}" --force >/dev/null 2>&1
 }
 
 run_script() {
@@ -89,7 +150,7 @@ payload = {"params": params, "dry_run": dry_run == "true"}
 print(base64.b64encode(json.dumps(payload).encode()).decode())
 PY
   )"
-  osascript -l JavaScript "$DIST_SCRIPT" "$payload"
+  run_dist_script "$payload"
 }
 
 run_script_raw() {
@@ -113,7 +174,7 @@ payload = {"params": params, "dry_run": dry_run == "true"}
 print(base64.b64encode(json.dumps(payload).encode()).decode())
 PY
   )"
-  osascript -l JavaScript "$DIST_SCRIPT" "$payload"
+  run_dist_script "$payload"
 }
 
 field() {
@@ -150,8 +211,8 @@ skip() {
   echo "  SKIPPED: $1 ($2)"
 }
 
-echo "==> Building latest dist/set-vscode-extension-version.js"
-"$DIR/build.sh"
+echo "==> Building latest deployed script ($PLATFORM)"
+build_dist
 
 echo "==> Capturing original state of $EXT_ID"
 ORIGINAL_VERSION="$(get_installed_version)"
@@ -169,10 +230,10 @@ restore_original_state() {
 
   echo "==> Restoring original state of $EXT_ID"
   if [[ -n "$ORIGINAL_VERSION" ]]; then
-    "$CODE_BIN" --install-extension "${EXT_ID}@${ORIGINAL_VERSION}" --force >/dev/null 2>&1 || \
+    code_cli --install-extension "${EXT_ID}@${ORIGINAL_VERSION}" --force >/dev/null 2>&1 || \
       echo "    WARNING: failed to restore ${EXT_ID}@${ORIGINAL_VERSION}"
   else
-    "$CODE_BIN" --uninstall-extension "$EXT_ID" >/dev/null 2>&1 || true
+    code_cli --uninstall-extension "$EXT_ID" >/dev/null 2>&1 || true
   fi
   local final
   final="$(get_installed_version)"
@@ -182,7 +243,7 @@ trap restore_original_state EXIT
 
 echo
 echo "=== Scenario 1: extension removed -> must no-op ==="
-"$CODE_BIN" --uninstall-extension "$EXT_ID" >/dev/null 2>&1 || true
+code_cli --uninstall-extension "$EXT_ID" >/dev/null 2>&1 || true
 check "extension is not installed before the run" "$(get_installed_version)" ""
 
 result="$(run_script "0.4.0" "false" "$USER_EXTENSION_PATH")"
@@ -194,7 +255,7 @@ check "extension is still not installed after the run" "$(get_installed_version)
 
 echo
 echo "=== Scenario 2: extension present, requested version 0.4.0 -> must set to 0.4.0 ==="
-"$CODE_BIN" --install-extension "$EXT_ID" >/dev/null 2>&1
+code_cli --install-extension "$EXT_ID" >/dev/null 2>&1
 before_version="$(get_installed_version)"
 echo "  Installed latest: $before_version"
 LATEST_VERSION="$before_version"
@@ -246,7 +307,7 @@ check "user_resolution_note is null" "$(field "$result" user_resolution_note)" "
 check "code --list-extensions independently confirms version $LATEST_VERSION" "$(get_installed_version)" "$LATEST_VERSION"
 
 echo
-echo "=== Scenario 5b: extension_path names a nonexistent user -> falls back to root ==="
+echo "=== Scenario 5b: extension_path names a nonexistent user -> falls back to the isolated identity ==="
 if [[ "$IS_ROOT" != true ]]; then
   echo "  NOTE: not running as root (re-run with 'sudo ${BASH_SOURCE[0]}' for the full check)."
   echo "        ran_as_root:true only means the script skips 'launchctl asuser' -"
@@ -325,10 +386,11 @@ echo "  envelope: $result"
 check "target_user is null" "$(field "$result" target_user)" "None"
 check "ran_as_root is true" "$(field "$result" ran_as_root)" "True"
 check "user_resolution_note is MISSING_EXTENSION_PATH" "$(field "$result" user_resolution_note)" "MISSING_EXTENSION_PATH"
-# Root's own isolated identity (HOME=/var/root) has no VS Code extensions of
-# its own, regardless of what $REAL_USER has installed - so this genuinely
-# reports not_installed, not already_correct_version.
-check "run still proceeds: action is not_installed (root's own identity has no extensions installed)" \
+# The isolated fallback identity (root's HOME=/var/root on mac; SYSTEM's own
+# profile on Windows) has no VS Code extensions of its own, regardless of
+# what $REAL_USER has installed - so this genuinely reports not_installed,
+# not already_correct_version.
+check "run still proceeds: action is not_installed (isolated identity has no extensions installed)" \
   "$(field "$result" action)" "not_installed"
 check "run still proceeds: status is skipped (not failure)" "$(field "$result" status)" "skipped"
 
@@ -364,7 +426,7 @@ check "target_user is $REAL_USER (path parsing also case-insensitive)" "$(field 
 check "user_resolution_note is null" "$(field "$result" user_resolution_note)" "None"
 
 echo
-echo "=== Scenario 14: extension_path is a real symlink escaping ~/.vscode/extensions -> EXTENSION_PATH_UNSAFE ==="
+echo "=== Scenario 14: extension_path is a real symlink escaping the extensions directory -> EXTENSION_PATH_UNSAFE ==="
 mkdir -p "$SYMLINK_TARGET"
 rm -f "$SYMLINK_PATH"
 ln -s "$SYMLINK_TARGET" "$SYMLINK_PATH"

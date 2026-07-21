@@ -28,6 +28,32 @@ fresh - if the extension isn't already present, it no-ops. Given a version,
 it upgrades or downgrades to exactly that version; given no version, it
 upgrades to latest.
 
+## Real-world check (shared, both platforms)
+
+`real_world_check_set_vscode_extension_version.sh` (repo root) is one
+opt-in, self-cleaning end-to-end check, shared between both platforms: it
+really installs/downgrades/upgrades a real, small, well-known extension
+(`njpwerner.autodocstring`) and asserts on the real result - not mocked,
+not part of either platform's regular test suite. The 14 scenarios and
+their assertions are identical regardless of platform; only how each
+individual command actually runs (invoking the real `code` CLI, invoking
+the deployed script under test) differs, selected via `--platform`. It
+always runs as bash on the Mac - for `--platform windows-remote` it drives
+a real Windows box over SSH rather than requiring bash on Windows.
+
+```bash
+./real_world_check_set_vscode_extension_version.sh --platform mac
+sudo ./real_world_check_set_vscode_extension_version.sh --platform mac   # + root-fallback scenarios
+
+# Windows: not implemented yet (in progress)
+./real_world_check_set_vscode_extension_version.sh --platform windows-remote --host <ip> --user <user> [--key <path>]
+```
+
+It captures the extension's original install state up front and restores
+it on exit regardless of pass/fail. Also reachable via
+`js_scripts/run_all_tests.sh --with-real-world-test` (see below), which
+runs it with `--platform mac` after the mocked suite.
+
 ## macOS (js_scripts/)
 
 | File | Purpose |
@@ -38,7 +64,6 @@ upgrades to latest.
 | `js_scripts/run_all_tests.sh` | Runs every test in `js_scripts/tests/`: policy modules under Node (`node --experimental-test-coverage`), runner modules via `osascript -l JavaScript` with `_runCommand` mocked - no real process is ever spawned. Safe to run anywhere. Pass `--with-real-world-test` to also run the real end-to-end check below (needs `sudo` for full coverage of the root-fallback scenarios). |
 | `js_scripts/tests/test_vscode_extension_version_policy.js` | Node test suite for the policy module. |
 | `js_scripts/tests/test_vscode_extension_version_runner.osascript.js` | Mocked JXA test suite for the runner module. |
-| `js_scripts/tests/real_world_check_set_vscode_extension_version.sh` | Opt-in, self-cleaning end-to-end check against a real extension (`njpwerner.autodocstring`) on this machine, running the actual built `dist/set-vscode-extension-version.js` via `osascript` - not mocked. Captures the extension's original install state up front and restores it on exit regardless of pass/fail. |
 
 ```bash
 js_scripts/build.sh              # build dist/set-vscode-extension-version.js
