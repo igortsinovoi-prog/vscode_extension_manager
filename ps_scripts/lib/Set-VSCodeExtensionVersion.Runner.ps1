@@ -140,6 +140,31 @@ function Test-VSCodeDirectoryExists {
   return Test-Path -LiteralPath $Path -PathType Container
 }
 
+function New-VSCodeDirectoryIfMissing {
+  param([string]$Path)
+  if (-not (Test-VSCodeDirectoryExists $Path)) {
+    New-Item -ItemType Directory -Path $Path -Force | Out-Null
+  }
+}
+
+function Get-VSCodeFileContent {
+  param([string]$Path)
+  if (-not (Test-VSCodeFileExists $Path)) { return $null }
+  return Get-Content -LiteralPath $Path -Raw
+}
+
+function Set-VSCodeFileContent {
+  param([string]$Path, [string]$Content)
+  Set-Content -LiteralPath $Path -Value $Content -Encoding utf8
+}
+
+function Remove-VSCodeFileIfExists {
+  param([string]$Path)
+  if (Test-VSCodeFileExists $Path) {
+    Remove-Item -LiteralPath $Path -Force
+  }
+}
+
 # Resolves symlink/junction reparse points and standardizes the path, then
 # lets the caller re-parse the result and compare against the original
 # string-level parse - the same two-step defense as the macOS side's
@@ -316,14 +341,106 @@ function Find-VSCodeCli {
 
 # ===== Section 5: Extension Version Actions =====
 
+# Derives the VS Code user-data-dir from $ExtensionsDir rather than taking
+# it as a separate parameter: extensions_dir always ends in
+# "...\.vscode\extensions" (see Resolve-VSCodeTargetUser and the SYSTEM
+# fallback constant above), so its grandparent is that same identity's own
+# profile root (a real user's C:\Users\<user>, or SYSTEM's own profile for
+# the isolated fallback) - user-data-dir is that profile's own
+# AppData\Roaming\Code, VS Code's real default location. Deriving it this
+# way means the temporary settings change below always lands in the SAME
+# identity's own space extensions_dir already targets, never a different
+# or unrelated location. Throws if $ExtensionsDir doesn't have the
+# expected shape, rather than guessing.
+function Get-VSCodeUserDataDir {
+  param([string]$ExtensionsDir)
+  $leaf = Split-Path $ExtensionsDir -Leaf
+  $vscodeDir = Split-Path $ExtensionsDir -Parent
+  $vscodeLeaf = Split-Path $vscodeDir -Leaf
+  if ($leaf -ne 'extensions' -or $vscodeLeaf -ne '.vscode') {
+    throw "Cannot derive user-data-dir: '$ExtensionsDir' does not end in \.vscode\extensions"
+  }
+  $profileRoot = Split-Path $vscodeDir -Parent
+  return Join-Path $profileRoot 'AppData\Roaming\Code'
+}
+
+# Real-world finding: as of VS Code 1.129, the marketplace only serves a
+# signature for an extension's current latest version - installing or
+# pinning ANY older version (the entire point of this script's --version
+# support: upgrade OR downgrade to an exact pinned version) fails with
+# "Signature verification failed: NotSigned" otherwise. Temporarily
+# setting extensions.verifySignature: false in the target identity's own
+# settings.json around each CLI call - never a different user's, and
+# reverted immediately after (see Restore-VSCodeSignatureVerification) -
+# makes this tool's own already-trusted, RTR-driven installs work
+# regardless of marketplace signing status, without leaving that setting
+# changed afterward or affecting the user's own interactive VS Code
+# session beyond the brief window of a single CLI invocation.
+#
+# Restoration writes back the exact original raw file text, not a
+# reparsed/reserialized version - settings.json commonly has jsonc
+# comments a parse+rewrite round-trip would silently destroy; only the
+# brief window during the CLI call itself goes through a parsed form.
+function Enable-VSCodeSignatureVerificationBypass {
+  param([string]$UserDataDir)
+  $settingsDir = Join-Path $UserDataDir 'User'
+  $settingsPath = Join-Path $settingsDir 'settings.json'
+  $fileExisted = Test-VSCodeFileExists $settingsPath
+  $originalRaw = if ($fileExisted) { Get-VSCodeFileContent $settingsPath } else { $null }
+
+  New-VSCodeDirectoryIfMissing $settingsDir
+
+  $settings = [ordered]@{}
+  if ($originalRaw -and $originalRaw.Trim()) {
+    try {
+      $parsed = $originalRaw | ConvertFrom-Json -AsHashtable
+      foreach ($key in $parsed.Keys) { $settings[$key] = $parsed[$key] }
+    } catch {
+      Write-VSCodeDiag "WARN: could not parse existing settings.json at ${settingsPath}: $_ - leaving it untouched, signature bypass not applied for this call"
+      return [PSCustomObject]@{ Applied = $false }
+    }
+  }
+  $settings['extensions.verifySignature'] = $false
+  Set-VSCodeFileContent $settingsPath ($settings | ConvertTo-Json -Depth 10)
+
+  return [PSCustomObject]@{
+    Applied      = $true
+    SettingsPath = $settingsPath
+    FileExisted  = $fileExisted
+    OriginalRaw  = $originalRaw
+  }
+}
+
+function Restore-VSCodeSignatureVerification {
+  param($State)
+  if (-not $State -or -not $State.Applied) { return }
+  try {
+    if ($State.FileExisted) {
+      Set-VSCodeFileContent $State.SettingsPath $State.OriginalRaw
+    } else {
+      Remove-VSCodeFileIfExists $State.SettingsPath
+    }
+  } catch {
+    Write-VSCodeDiag "WARN: could not restore settings.json at $($State.SettingsPath): $_"
+  }
+}
+
 # Runs `code` pointed at $ExtensionsDir via --extensions-dir - this is the
 # one thing every CLI invocation in this script goes through, the Windows
 # analogue of the macOS side's runCode dispatch (launchctl asuser / root
-# fallback), just without ever changing process identity.
+# fallback), just without ever changing process identity. Brackets the
+# call with the signature-verification bypass above, enabled only for
+# this one invocation and always restored afterward, success or failure.
 function Invoke-VSCodeCli {
   param([string]$CodePath, [string]$ExtensionsDir, [string[]]$Arguments, [int]$TimeoutSec)
-  $fullArgs = @('--extensions-dir', $ExtensionsDir) + $Arguments
-  return Invoke-VSCodeNativeCommand -FilePath $CodePath -ArgumentList $fullArgs -TimeoutSec $TimeoutSec
+  $userDataDir = Get-VSCodeUserDataDir $ExtensionsDir
+  $bypassState = Enable-VSCodeSignatureVerificationBypass $userDataDir
+  try {
+    $fullArgs = @('--extensions-dir', $ExtensionsDir, '--user-data-dir', $userDataDir) + $Arguments
+    return Invoke-VSCodeNativeCommand -FilePath $CodePath -ArgumentList $fullArgs -TimeoutSec $TimeoutSec
+  } finally {
+    Restore-VSCodeSignatureVerification $bypassState
+  }
 }
 
 function Get-VSCodeInstalledExtensionsRaw {

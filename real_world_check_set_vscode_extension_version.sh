@@ -59,6 +59,11 @@ PLATFORM=""
 REMOTE_HOST=""
 REMOTE_USER=""
 REMOTE_KEY="$HOME/.ssh/utm_windows_vm"
+REMOTE_PASSWORD=""
+SSH_OPTS=()
+SSH_PREFIX=()
+SCP_PREFIX=()
+REMOTE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -66,8 +71,9 @@ while [[ $# -gt 0 ]]; do
     --host) REMOTE_HOST="$2"; shift 2 ;;
     --user) REMOTE_USER="$2"; shift 2 ;;
     --key) REMOTE_KEY="$2"; shift 2 ;;
+    --password) REMOTE_PASSWORD="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: $0 --platform mac|windows-remote [--host H --user U --key K]"
+      echo "Usage: $0 --platform mac|windows-remote [--host H --user U (--key K | --password P)]"
       exit 0
       ;;
     *)
@@ -77,18 +83,42 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Password auth (via sshpass) if --password was given, otherwise key auth.
+# BatchMode=yes is deliberately only set for key auth - it forces SSH to
+# fail instead of prompting, which is what you want when a key is supposed
+# to just work, but would block sshpass's whole mechanism (answering an
+# interactive password prompt) if set for password auth.
+if [[ -n "$REMOTE_PASSWORD" ]]; then
+  if ! command -v sshpass >/dev/null 2>&1; then
+    echo "Error: --password requires sshpass (brew install sshpass)" >&2
+    exit 1
+  fi
+  SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no)
+  SSH_PREFIX=(sshpass -p "$REMOTE_PASSWORD" ssh)
+  SCP_PREFIX=(sshpass -p "$REMOTE_PASSWORD" scp)
+else
+  SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -i "$REMOTE_KEY")
+  SSH_PREFIX=(ssh)
+  SCP_PREFIX=(scp)
+fi
+
 # ===== Platform dispatch =====
 #
 # Each platform branch below defines the same set of primitives the
 # scenario logic (further down) is written against:
-#   code_cli <args...>        - runs the real `code` CLI, prints stdout
-#   run_dist_script <payload> - invokes the deployed script under test with
-#                                a base64 RTR payload, prints its JSON envelope
-#   build_dist                 - (re)builds the deployed script from source
-#   EXT_PATH_PREFIX             - "<extensions-dir>", used to build
-#                                extension_path values in the right shape
-#   REAL_USER, IS_ROOT           - identity concepts scenario 5 depends on
-#   NO_SUCH_USER_PATH            - extension_path naming a nonexistent user
+#   code_cli <args...>          - runs the real `code` CLI, prints stdout
+#   run_dist_script <payload>   - invokes the deployed script under test with
+#                                  a base64 RTR payload, prints its JSON envelope
+#   build_dist                  - (re)builds the deployed script from source
+#   setup_symlink_scenario /
+#   teardown_symlink_scenario   - scenario 14's real filesystem symlink
+#   EXT_PATH_PREFIX, PATH_SEP   - used to build extension_path values in the
+#                                  right shape (PATH_SEP matters: the
+#                                  Windows path parser requires a literal
+#                                  backslash immediately before the leaf,
+#                                  not '/')
+#   REAL_USER, IS_ROOT          - identity concepts scenario 5 depends on
+#   NO_SUCH_USER_PATH           - extension_path naming a nonexistent user
 case "$PLATFORM" in
   mac)
     CODE_BIN="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
@@ -99,7 +129,9 @@ case "$PLATFORM" in
     REAL_USER="${SUDO_USER:-$(whoami)}"
     if [[ "$EUID" -eq 0 ]]; then IS_ROOT=true; else IS_ROOT=false; fi
     EXT_PATH_PREFIX="$HOME/.vscode/extensions"
+    PATH_SEP="/"
     NO_SUCH_USER_PATH="/Users/glow_test_no_such_user/.vscode/extensions/${EXT_ID}-0.0.0"
+    SYMLINK_TARGET="/tmp/glow_test_evil_target"
 
     if [[ ! -x "$CODE_BIN" ]]; then
       echo "Error: VS Code CLI not found at $CODE_BIN" >&2
@@ -109,11 +141,96 @@ case "$PLATFORM" in
     code_cli() { "$CODE_BIN" "$@"; }
     run_dist_script() { osascript -l JavaScript "$DIST_SCRIPT" "$1"; }
     build_dist() { "$ROOT_DIR/js_scripts/build.sh"; }
+    setup_symlink_scenario() {
+      mkdir -p "$SYMLINK_TARGET"
+      rm -f "$SYMLINK_PATH"
+      ln -s "$SYMLINK_TARGET" "$SYMLINK_PATH"
+    }
+    teardown_symlink_scenario() {
+      rm -f "$SYMLINK_PATH"
+      rmdir "$SYMLINK_TARGET" 2>/dev/null || true
+    }
     ;;
   windows-remote)
-    echo "Error: --platform windows-remote isn't implemented yet - this is phase 1" >&2
-    echo "(rewrite + verify on mac first). Coming in a follow-up." >&2
-    exit 1
+    if [[ -z "$REMOTE_HOST" || -z "$REMOTE_USER" ]]; then
+      echo "Error: --platform windows-remote requires --host and --user" >&2
+      exit 1
+    fi
+    REMOTE="$REMOTE_USER@$REMOTE_HOST"
+    LOCAL_DIST_FILE="$ROOT_DIR/ps_scripts/dist/Set-VSCodeExtensionVersion.ps1"
+
+    # remote_ps <<'PS' feeds a PowerShell script to the remote box via
+    # stdin, rather than trying to cram it onto the ssh command line.
+    # Windows OpenSSH's default remote shell is cmd.exe, which has entirely
+    # different quoting rules than bash - piping the script through
+    # "powershell -Command -" sidesteps that mismatch completely: cmd.exe
+    # only ever sees the fixed, argument-free invocation, and PowerShell
+    # itself parses everything that actually varies (paths, payloads).
+    remote_ps() {
+      "${SSH_PREFIX[@]}" "${SSH_OPTS[@]}" "$REMOTE" "powershell -NoProfile -Command -"
+    }
+
+    echo "==> Resolving remote temp directory on $REMOTE_HOST" >&2
+    REMOTE_TEMP="$(remote_ps <<'PS' | tr -d '\r'
+[System.Environment]::GetEnvironmentVariable('TEMP')
+PS
+    )"
+    if [[ -z "$REMOTE_TEMP" ]]; then
+      echo "Error: could not resolve %TEMP% on $REMOTE_HOST" >&2
+      exit 1
+    fi
+    REMOTE_DIST="$REMOTE_TEMP\\Set-VSCodeExtensionVersion.ps1"
+
+    REAL_USER="$REMOTE_USER"
+    # A plain admin SSH session is not NT AUTHORITY\SYSTEM, so it can't
+    # write into the SYSTEM-profile fallback dir any more than a non-sudo
+    # mac session can write into /var/root - same IS_ROOT gating, same
+    # reason (see the mac branch above and scenario 5b below).
+    IS_ROOT=false
+    EXT_PATH_PREFIX="C:\\Users\\${REMOTE_USER}\\.vscode\\extensions"
+    PATH_SEP="\\"
+    NO_SUCH_USER_PATH="C:\\Users\\glow_test_no_such_user\\.vscode\\extensions\\${EXT_ID}-0.0.0"
+    SYMLINK_TARGET="C:\\Windows\\Temp\\glow_test_evil_target"
+
+    build_dist() {
+      "$ROOT_DIR/ps_scripts/build.sh" >&2
+      "${SCP_PREFIX[@]}" -q "${SSH_OPTS[@]}" "$LOCAL_DIST_FILE" "$REMOTE:$REMOTE_DIST"
+      echo "  Copied to ${REMOTE_HOST}:${REMOTE_DIST}" >&2
+    }
+
+    code_cli() {
+      # code.cmd's installer normally puts it on PATH; if this ever fails
+      # with "not recognized", the fix is to mirror Find-VSCodeCli's
+      # search-known-paths logic (ps_scripts/lib/...Runner.ps1) here too.
+      local quoted="" a
+      for a in "$@"; do quoted+=" \"$a\""; done
+      remote_ps <<PS | tr -d '\r'
+code$quoted
+PS
+    }
+
+    run_dist_script() {
+      local payload="$1"
+      remote_ps <<PS
+pwsh -NoProfile -File "$REMOTE_DIST" "$payload"
+PS
+    }
+
+    setup_symlink_scenario() {
+      remote_ps <<PS
+New-Item -ItemType Directory -Path "$SYMLINK_TARGET" -Force | Out-Null
+Remove-Item -Path "$SYMLINK_PATH" -Force -ErrorAction SilentlyContinue
+New-Item -ItemType SymbolicLink -Path "$SYMLINK_PATH" -Target "$SYMLINK_TARGET" -Force | Out-Null
+PS
+    }
+
+    teardown_symlink_scenario() {
+      remote_ps <<PS
+Remove-Item -Path "$SYMLINK_PATH" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "$SYMLINK_TARGET" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "$REMOTE_DIST" -Force -ErrorAction SilentlyContinue
+PS
+    }
     ;;
   *)
     echo "Error: --platform must be 'mac' or 'windows-remote'" >&2
@@ -121,10 +238,9 @@ case "$PLATFORM" in
     ;;
 esac
 
-MISMATCHED_ID_PATH="$EXT_PATH_PREFIX/some-other.extension-0.0.0"
-SYMLINK_TARGET="/tmp/glow_test_evil_target"
-SYMLINK_PATH="$EXT_PATH_PREFIX/${EXT_ID}-9.9.9-symlinktest"
-USER_EXTENSION_PATH="$EXT_PATH_PREFIX/${EXT_ID}-0.0.0"  # shape only; leaf need not exist
+MISMATCHED_ID_PATH="${EXT_PATH_PREFIX}${PATH_SEP}some-other.extension-0.0.0"
+SYMLINK_PATH="${EXT_PATH_PREFIX}${PATH_SEP}${EXT_ID}-9.9.9-symlinktest"
+USER_EXTENSION_PATH="${EXT_PATH_PREFIX}${PATH_SEP}${EXT_ID}-0.0.0"  # shape only; leaf need not exist
 
 get_installed_version() {
   code_cli --list-extensions --show-versions 2>/dev/null \
@@ -225,8 +341,13 @@ fi
 restore_original_state() {
   echo
   echo "==> Cleaning up test artifacts"
-  rm -f "$SYMLINK_PATH"
-  rmdir "$SYMLINK_TARGET" 2>/dev/null || true
+  # Guarded: this runs under `set -e` inside a trap, so an unguarded
+  # nonzero exit here (e.g. a transient SSH hiccup, even if the underlying
+  # Remove-Item calls all actually succeeded) would abort the rest of this
+  # function - skipping the far more important step below. A cleanup
+  # helper failing must never prevent restoring the extension's original
+  # install state.
+  teardown_symlink_scenario || echo "    WARNING: symlink-scenario artifact cleanup reported an error (continuing)"
 
   echo "==> Restoring original state of $EXT_ID"
   if [[ -n "$ORIGINAL_VERSION" ]]; then
@@ -427,9 +548,7 @@ check "user_resolution_note is null" "$(field "$result" user_resolution_note)" "
 
 echo
 echo "=== Scenario 14: extension_path is a real symlink escaping the extensions directory -> EXTENSION_PATH_UNSAFE ==="
-mkdir -p "$SYMLINK_TARGET"
-rm -f "$SYMLINK_PATH"
-ln -s "$SYMLINK_TARGET" "$SYMLINK_PATH"
+setup_symlink_scenario
 
 result="$(run_script "0.4.0" "false" "$SYMLINK_PATH")"
 echo "  envelope: $result"
@@ -438,8 +557,7 @@ check "target_user is $REAL_USER (parsed from path shape, kept for diagnostics)"
 check "ran_as_root is true (unsafe path falls back to root, not the symlink target)" "$(field "$result" ran_as_root)" "True"
 check "run still proceeds: status is skipped (not failure)" "$(field "$result" status)" "skipped"
 
-rm -f "$SYMLINK_PATH"
-rmdir "$SYMLINK_TARGET" 2>/dev/null || true
+teardown_symlink_scenario
 
 echo
 echo "$PASS passed, $FAIL failed"

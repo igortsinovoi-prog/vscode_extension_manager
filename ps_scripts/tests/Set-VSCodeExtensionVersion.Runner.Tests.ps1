@@ -24,43 +24,53 @@ BeforeAll {
   }
 }
 
-BeforeEach {
-  $script:CommandLog = New-Object System.Collections.Generic.List[object]
-  $script:MockConfig = [PSCustomObject]@{
-    ListExtensionsExitCode       = 0
-    ListExtensionsStdout         = ''
-    ListExtensionsStdoutSequence = $null
-    ListExtensionsCallIndex      = 0
-    InstallResult                = [PSCustomObject]@{ ExitCode = 0; Stdout = ''; Stderr = '' }
-  }
+# Pester 6 dropped support for BeforeEach/Mock declared directly at the
+# container root (only BeforeAll is still allowed there) - everything that
+# needs to run per-test must live inside a Describe block, so the shared
+# setup below and all the Context blocks that use it are nested inside one
+# enclosing Describe rather than sitting at file scope.
+Describe 'Set-VSCodeExtensionVersion.Runner' {
+  BeforeEach {
+    $script:CommandLog = New-Object System.Collections.Generic.List[object]
+    $script:MockConfig = [PSCustomObject]@{
+      ListExtensionsExitCode       = 0
+      ListExtensionsStdout         = ''
+      ListExtensionsStdoutSequence = $null
+      ListExtensionsCallIndex      = 0
+      InstallResult                = [PSCustomObject]@{ ExitCode = 0; Stdout = ''; Stderr = '' }
+    }
 
-  Mock Write-VSCodeDiag { }
-  Mock Test-VSCodeFileExists { $true }
-  Mock Test-VSCodeDirectoryExists { $true }
-  Mock Resolve-VSCodeSafePath { param($Path) return $Path }
+    Mock Write-VSCodeDiag { }
+    Mock Test-VSCodeFileExists { $true }
+    Mock Test-VSCodeDirectoryExists { $true }
+    Mock Resolve-VSCodeSafePath { param($Path) return $Path }
+    Mock New-VSCodeDirectoryIfMissing { }
+    Mock Get-VSCodeFileContent { $null }
+    Mock Set-VSCodeFileContent { }
+    Mock Remove-VSCodeFileIfExists { }
 
-  Mock Invoke-VSCodeNativeCommand {
-    param($FilePath, $ArgumentList, $TimeoutSec)
-    $script:CommandLog.Add([PSCustomObject]@{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutSec = $TimeoutSec })
+    Mock Invoke-VSCodeNativeCommand {
+      param($FilePath, $ArgumentList, $TimeoutSec)
+      $script:CommandLog.Add([PSCustomObject]@{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutSec = $TimeoutSec })
 
-    if ($ArgumentList -contains '--list-extensions') {
-      $stdout = $script:MockConfig.ListExtensionsStdout
-      if ($script:MockConfig.ListExtensionsStdoutSequence) {
-        $seq = $script:MockConfig.ListExtensionsStdoutSequence
-        $idx = [Math]::Min($script:MockConfig.ListExtensionsCallIndex, $seq.Count - 1)
-        $stdout = $seq[$idx]
-        $script:MockConfig.ListExtensionsCallIndex++
+      if ($ArgumentList -contains '--list-extensions') {
+        $stdout = $script:MockConfig.ListExtensionsStdout
+        if ($script:MockConfig.ListExtensionsStdoutSequence) {
+          $seq = $script:MockConfig.ListExtensionsStdoutSequence
+          $idx = [Math]::Min($script:MockConfig.ListExtensionsCallIndex, $seq.Count - 1)
+          $stdout = $seq[$idx]
+          $script:MockConfig.ListExtensionsCallIndex++
+        }
+        return [PSCustomObject]@{ ExitCode = $script:MockConfig.ListExtensionsExitCode; Stdout = $stdout; Stderr = '' }
       }
-      return [PSCustomObject]@{ ExitCode = $script:MockConfig.ListExtensionsExitCode; Stdout = $stdout; Stderr = '' }
+      if ($ArgumentList -contains '--install-extension') {
+        return $script:MockConfig.InstallResult
+      }
+      return [PSCustomObject]@{ ExitCode = 1; Stdout = ''; Stderr = "unmocked command: $FilePath $($ArgumentList -join ' ')" }
     }
-    if ($ArgumentList -contains '--install-extension') {
-      return $script:MockConfig.InstallResult
-    }
-    return [PSCustomObject]@{ ExitCode = 1; Stdout = ''; Stderr = "unmocked command: $FilePath $($ArgumentList -join ' ')" }
   }
-}
 
-Describe 'Resolve-VSCodeTargetUser' {
+Context 'Resolve-VSCodeTargetUser' {
   It 'real profile directory -> resolves extensions dir under that user, no resolution note' {
     $result = Resolve-VSCodeTargetUser $script:JdoePath 'ms-python.python'
     $result.User | Should -Be 'jdoe'
@@ -104,17 +114,79 @@ Describe 'Resolve-VSCodeTargetUser' {
   }
 }
 
-Describe 'Invoke-VSCodeCli dispatch' {
-  It 'always prepends --extensions-dir before the caller-supplied arguments' {
+Context 'Get-VSCodeUserDataDir' {
+  It 'derives AppData\Roaming\Code from the profile root above \.vscode\extensions' {
+    Get-VSCodeUserDataDir 'C:\Users\jdoe\.vscode\extensions' | Should -Be 'C:\Users\jdoe\AppData\Roaming\Code'
+  }
+
+  It 'derives it the same way for the SYSTEM fallback extensions dir' {
+    Get-VSCodeUserDataDir $Script:RootFallbackExtensionsDir | Should -Be (Join-Path (Split-Path $Script:RootFallbackExtensionsDir -Parent | Split-Path -Parent) 'AppData\Roaming\Code')
+  }
+
+  It 'throws if the path does not end in \.vscode\extensions' {
+    { Get-VSCodeUserDataDir 'C:\Users\jdoe\Documents' } | Should -Throw
+  }
+}
+
+Context 'Enable-VSCodeSignatureVerificationBypass / Restore-VSCodeSignatureVerification' {
+  It 'sets extensions.verifySignature: false when no settings.json existed, and deletes it on restore' {
+    Mock Test-VSCodeFileExists { $false }
+    $state = Enable-VSCodeSignatureVerificationBypass 'C:\Users\jdoe\AppData\Roaming\Code'
+    $state.Applied | Should -BeTrue
+    $state.FileExisted | Should -BeFalse
+    Should -Invoke Set-VSCodeFileContent -Times 1 -ParameterFilter { $Content -match '"extensions.verifySignature":\s*false' }
+
+    Restore-VSCodeSignatureVerification $state
+    Should -Invoke Remove-VSCodeFileIfExists -Times 1
+  }
+
+  It 'preserves other keys and restores the exact original raw text when settings.json already existed' {
+    $originalRaw = '{"editor.fontSize": 14}'
+    Mock Get-VSCodeFileContent { $originalRaw }
+    $state = Enable-VSCodeSignatureVerificationBypass 'C:\Users\jdoe\AppData\Roaming\Code'
+    $state.FileExisted | Should -BeTrue
+    $state.OriginalRaw | Should -Be $originalRaw
+    Should -Invoke Set-VSCodeFileContent -Times 1 -ParameterFilter {
+      $Content -match '"editor.fontSize":\s*14' -and $Content -match '"extensions.verifySignature":\s*false'
+    }
+
+    Restore-VSCodeSignatureVerification $state
+    Should -Invoke Set-VSCodeFileContent -Times 1 -ParameterFilter { $Content -eq $originalRaw }
+  }
+
+  It 'skips applying (and does not touch the file) if existing settings.json fails to parse' {
+    Mock Get-VSCodeFileContent { 'not valid json {' }
+    $state = Enable-VSCodeSignatureVerificationBypass 'C:\Users\jdoe\AppData\Roaming\Code'
+    $state.Applied | Should -BeFalse
+    Should -Invoke Set-VSCodeFileContent -Times 0
+  }
+}
+
+Context 'Invoke-VSCodeCli dispatch' {
+  It 'always prepends --extensions-dir and the derived --user-data-dir before the caller-supplied arguments' {
     Invoke-VSCodeCli -CodePath 'C:\code.cmd' -ExtensionsDir 'C:\Users\jdoe\.vscode\extensions' `
       -Arguments @('--list-extensions', '--show-versions') -TimeoutSec 20
     $script:CommandLog.Count | Should -Be 1
     $script:CommandLog[0].FilePath | Should -Be 'C:\code.cmd'
-    $script:CommandLog[0].ArgumentList | Should -Be @('--extensions-dir', 'C:\Users\jdoe\.vscode\extensions', '--list-extensions', '--show-versions')
+    $script:CommandLog[0].ArgumentList | Should -Be @(
+      '--extensions-dir', 'C:\Users\jdoe\.vscode\extensions',
+      '--user-data-dir', 'C:\Users\jdoe\AppData\Roaming\Code',
+      '--list-extensions', '--show-versions'
+    )
+  }
+
+  It 'restores the signature-verification setting even after the CLI call, via try/finally' {
+    Mock Get-VSCodeFileContent { '{"foo":"bar"}' }
+    Invoke-VSCodeCli -CodePath 'C:\code.cmd' -ExtensionsDir 'C:\Users\jdoe\.vscode\extensions' `
+      -Arguments @('--list-extensions') -TimeoutSec 20
+    # One Set-VSCodeFileContent call to apply the bypass, one to restore -
+    # the second must be the original raw text, not the bypassed version.
+    Should -Invoke Set-VSCodeFileContent -Times 2
+    Should -Invoke Set-VSCodeFileContent -Times 1 -ParameterFilter { $Content -eq '{"foo":"bar"}' }
   }
 }
 
-Describe 'Invoke-VSCodeUpgradeToLatest / Invoke-VSCodeSetExactVersion dry-run gating' {
+Context 'Invoke-VSCodeUpgradeToLatest / Invoke-VSCodeSetExactVersion dry-run gating' {
   It 'upgrade: dry run does not invoke the CLI at all' {
     $result = Invoke-VSCodeUpgradeToLatest 'C:\code.cmd' 'C:\Users\jdoe\.vscode\extensions' 'ms-python.python' $true
     $result.Attempted | Should -BeFalse
@@ -147,7 +219,7 @@ Describe 'Invoke-VSCodeUpgradeToLatest / Invoke-VSCodeSetExactVersion dry-run ga
   }
 }
 
-Describe 'Invoke-SetVSCodeExtensionVersion end-to-end' {
+Context 'Invoke-SetVSCodeExtensionVersion end-to-end' {
   It 'invalid extension_id -> failure envelope, INVALID_PARAMS' {
     $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'not-an-id' } $true) | ConvertFrom-Json
     $result.status | Should -Be 'failure'
@@ -250,7 +322,7 @@ Describe 'Invoke-SetVSCodeExtensionVersion end-to-end' {
   }
 }
 
-Describe 'ConvertTo-VSCodeCliResultJson / ConvertTo-VSCodeErrorJson' {
+Context 'ConvertTo-VSCodeCliResultJson / ConvertTo-VSCodeErrorJson' {
   It 'converts a dry-run action result to attempted/dry_run only' {
     $actionResult = [PSCustomObject]@{ Attempted = $false; DryRun = $true; Ok = $false; Stderr = '' }
     $json = ConvertTo-VSCodeCliResultJson $actionResult
@@ -284,7 +356,7 @@ Describe 'ConvertTo-VSCodeCliResultJson / ConvertTo-VSCodeErrorJson' {
   }
 }
 
-Describe 'JSON envelope field casing (raw wire format, not just case-insensitive property access)' {
+Context 'JSON envelope field casing (raw wire format, not just case-insensitive property access)' {
   # ConvertFrom-Json + PowerShell's case-insensitive member access would
   # mask a casing bug (e.g. "ExitCode" vs "exit_code" both read fine via
   # .ExitCode after deserializing, and PowerShell's -match is ALSO
@@ -324,4 +396,5 @@ Describe 'JSON envelope field casing (raw wire format, not just case-insensitive
     ($rawJson -cmatch '"Code"') | Should -BeFalse
     ($rawJson -cmatch '"Message"') | Should -BeFalse
   }
+}
 }
