@@ -38,6 +38,12 @@ Describe 'Set-VSCodeExtensionVersion.Runner' {
       ListExtensionsStdoutSequence = $null
       ListExtensionsCallIndex      = 0
       InstallResult                = [PSCustomObject]@{ ExitCode = 0; Stdout = ''; Stderr = '' }
+      # Restart-VSCodeIfRunning's own seam - default to "nobody has VS
+      # Code running", overridden per-test. Must be declared here, not
+      # added later via plain assignment - PSCustomObject doesn't support
+      # adding a new property that way (confirmed: threw "The property
+      # 'RunningPids' cannot be found on this object" when tried).
+      RunningPids                  = @()
     }
 
     Mock Write-VSCodeDiag { }
@@ -67,6 +73,42 @@ Describe 'Set-VSCodeExtensionVersion.Runner' {
         return $script:MockConfig.InstallResult
       }
       return [PSCustomObject]@{ ExitCode = 1; Stdout = ''; Stderr = "unmocked command: $FilePath $($ArgumentList -join ' ')" }
+    }
+
+    $script:StopProcessLog = New-Object System.Collections.Generic.List[object]
+    $script:ScheduledTaskLog = New-Object System.Collections.Generic.List[object]
+    Mock Get-VSCodeProcessOwners {
+      param($ProcessName)
+      return $script:MockConfig.RunningPids | ForEach-Object {
+        [PSCustomObject]@{ ProcessId = $_; User = 'jdoe' }
+      }
+    }
+    Mock Stop-Process {
+      param($Id)
+      $script:StopProcessLog.Add($Id)
+    }
+    # New-ScheduledTaskAction/New-ScheduledTaskPrincipal deliberately NOT
+    # mocked - they're cheap, pure, side-effect-free object constructors,
+    # and mocking them turned out to matter: Register-ScheduledTask's real
+    # -Action/-Principal parameters expect actual typed CIM objects, and
+    # feeding it a generic PSCustomObject stand-in from a mocked
+    # constructor failed parameter binding before this test's own
+    # Register-ScheduledTask mock ever ran - confirmed only by actually
+    # running this suite against a real Windows box; the failure was
+    # silently swallowed by Restart-VSCodeIfRunning's own catch block, so
+    # only "unregister" ever showed up in the log with no clue why
+    # "register"/"start" never did.
+    Mock Register-ScheduledTask {
+      param($TaskName, $Action, $Principal)
+      $script:ScheduledTaskLog.Add([PSCustomObject]@{ Event = 'register'; TaskName = $TaskName; Action = $Action; Principal = $Principal })
+    }
+    Mock Start-ScheduledTask {
+      param($TaskName)
+      $script:ScheduledTaskLog.Add([PSCustomObject]@{ Event = 'start'; TaskName = $TaskName })
+    }
+    Mock Unregister-ScheduledTask {
+      param($TaskName)
+      $script:ScheduledTaskLog.Add([PSCustomObject]@{ Event = 'unregister'; TaskName = $TaskName })
     }
   }
 
@@ -219,6 +261,44 @@ Context 'Invoke-VSCodeUpgradeToLatest / Invoke-VSCodeSetExactVersion dry-run gat
   }
 }
 
+Context 'Get-VSCodeRunningPidsForUser / Restart-VSCodeIfRunning' {
+  It 'no VS Code processes running -> empty' {
+    $script:MockConfig.RunningPids = @()
+    Get-VSCodeRunningPidsForUser 'jdoe' | Should -BeNullOrEmpty
+  }
+
+  It 'VS Code running as the target user -> returns its pid' {
+    $script:MockConfig.RunningPids = @(4242)
+    Get-VSCodeRunningPidsForUser 'jdoe' | Should -Be @(4242)
+  }
+
+  It 'null/empty target user -> never attempts anything, returns $false' {
+    Restart-VSCodeIfRunning $null 'C:\Program Files\Microsoft VS Code\bin\code.cmd' | Should -BeFalse
+    $script:StopProcessLog.Count | Should -Be 0
+    $script:ScheduledTaskLog.Count | Should -Be 0
+  }
+
+  It 'not running -> no stop/relaunch attempted, returns $false' {
+    $script:MockConfig.RunningPids = @()
+    Restart-VSCodeIfRunning 'jdoe' 'C:\Program Files\Microsoft VS Code\bin\code.cmd' | Should -BeFalse
+    $script:StopProcessLog.Count | Should -Be 0
+    $script:ScheduledTaskLog.Count | Should -Be 0
+  }
+
+  It 'running -> stops the process, then registers/starts/unregisters a one-shot interactive Scheduled Task pointed at Code.exe' {
+    $script:MockConfig.RunningPids = @(4242)
+    $result = Restart-VSCodeIfRunning 'jdoe' 'C:\Program Files\Microsoft VS Code\bin\code.cmd'
+    $result | Should -BeTrue
+    $script:StopProcessLog | Should -Be @(4242)
+
+    ($script:ScheduledTaskLog | Select-Object -ExpandProperty Event) | Should -Be @('register', 'start', 'unregister')
+    $registerEntry = $script:ScheduledTaskLog | Where-Object { $_.Event -eq 'register' }
+    $registerEntry.Action.Execute | Should -Be 'C:\Program Files\Microsoft VS Code\Code.exe'
+    $registerEntry.Principal.UserId | Should -Be 'jdoe'
+    $registerEntry.Principal.LogonType | Should -Be 'Interactive'
+  }
+}
+
 Context 'Invoke-SetVSCodeExtensionVersion end-to-end' {
   It 'invalid extension_id -> failure envelope, INVALID_PARAMS' {
     $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'not-an-id' } $true) | ConvertFrom-Json
@@ -272,6 +352,39 @@ Context 'Invoke-SetVSCodeExtensionVersion end-to-end' {
     $result.installed_version_before | Should -Be '2024.1.0'
     $result.installed_version_after | Should -Be '2024.5.0'
     $result.cli_result.Ok | Should -BeTrue
+    # VS Code isn't "running" per the default mock (RunningPids empty) -
+    # nothing to restart, so this must stay false.
+    $result.vscode_restarted | Should -BeFalse
+  }
+
+  It 'differing version, real run, VS Code already running -> restarts it, reports vscode_restarted true' {
+    $script:MockConfig.ListExtensionsStdoutSequence = @("ms-python.python@2024.1.0`n", "ms-python.python@2024.5.0`n")
+    $script:MockConfig.InstallResult = [PSCustomObject]@{ ExitCode = 0; Stdout = ''; Stderr = '' }
+    $script:MockConfig.RunningPids = @(4242)
+    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.5.0'; extension_path = $script:JdoePath } $false) | ConvertFrom-Json
+    $result.status | Should -Be 'success'
+    $result.changed | Should -BeTrue
+    $result.vscode_restarted | Should -BeTrue
+    $script:StopProcessLog | Should -Be @(4242)
+  }
+
+  It 'already at the target version (no change) -> never attempts a restart even if VS Code is running' {
+    $script:MockConfig.ListExtensionsStdout = "ms-python.python@2024.1.0`n"
+    $script:MockConfig.RunningPids = @(4242)
+    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.1.0'; extension_path = $script:JdoePath } $false) | ConvertFrom-Json
+    $result.status | Should -Be 'skipped'
+    $result.vscode_restarted | Should -BeFalse
+    $script:StopProcessLog.Count | Should -Be 0
+  }
+
+  It 'dry run with a pending change -> never attempts a restart even if VS Code is running' {
+    $script:MockConfig.ListExtensionsStdout = "ms-python.python@2024.1.0`n"
+    $script:MockConfig.RunningPids = @(4242)
+    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.5.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
+    $result.status | Should -Be 'skipped'
+    $result.dry_run | Should -BeTrue
+    $result.vscode_restarted | Should -BeFalse
+    $script:StopProcessLog.Count | Should -Be 0
   }
 
   It 'differing version, CLI install fails -> failure envelope' {

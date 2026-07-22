@@ -6,3 +6,6 @@
 # Build output (see js_scripts/build.sh, ps_scripts/build.ps1)
 js_scripts/dist/
 ps_scripts/dist/
+
+# Test run logs (see run_all_tests.sh)
+test_logs/

@@ -67,8 +67,18 @@ if [[ -n "$REMOTE_PASSWORD" ]]; then
     exit 1
   fi
   SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no)
-  SSH_PREFIX=(sshpass -p "$REMOTE_PASSWORD" ssh)
-  SCP_PREFIX=(sshpass -p "$REMOTE_PASSWORD" scp)
+  # -e (password via the SSHPASS env var), not -p - see
+  # real_world_check_set_vscode_extension_version.sh's own comment on this
+  # same pattern: -p crashed outright (SIGSEGV in sshpass's own
+  # hide_password()) partway through a real run on this machine.
+  export SSHPASS="$REMOTE_PASSWORD"
+  # -eSSHPASS, not a bare -e - see
+  # real_world_check_set_vscode_extension_version.sh's own comment on
+  # this same pattern: the optional env-var-name argument must be
+  # directly attached, or it misparses the next word (the actual command
+  # to run) as the env var name instead.
+  SSH_PREFIX=(sshpass -eSSHPASS ssh)
+  SCP_PREFIX=(sshpass -eSSHPASS scp)
 else
   SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -i "$REMOTE_KEY")
   SSH_PREFIX=(ssh)

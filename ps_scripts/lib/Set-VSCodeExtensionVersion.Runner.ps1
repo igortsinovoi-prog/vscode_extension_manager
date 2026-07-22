@@ -443,6 +443,94 @@ function Invoke-VSCodeCli {
   }
 }
 
+# A changed extension version only takes effect for a window's already-
+# running extension host once that window is reloaded/restarted - VS
+# Code does not hot-swap an active extension's code on disk changing out
+# from under it. A managed version-pinning tool can't rely on the user
+# noticing a "reload required" prompt (or one even appearing) on their
+# own, so if the target user has VS Code running, it's fully restarted
+# after a real, successful, changed version update. Unlike the macOS
+# side (which impersonates the target user via launchctl asuser, so it
+# can just quit/relaunch directly as them), this script never
+# impersonates anyone (see this file's own header) - relaunching a GUI
+# process INTO an arbitrary other user's session from a SYSTEM-context
+# script needs a different mechanism than starting a new process: a
+# one-shot Scheduled Task with -LogonType Interactive, registered,
+# triggered, and unregistered again immediately - the supported way to
+# start a process in another user's real interactive session without
+# token impersonation/duplication. Best-effort: never affects the run's
+# overall success/failure, only logged to diagnostics.
+# Single seam wrapping the two chained CIM calls (Get-CimInstance +
+# each process's own GetOwner method) - a custom function, not the raw
+# cmdlets, mirrors Invoke-VSCodeNativeCommand's own rationale: mocking
+# two real cmdlets directly through Pester proved unreliable here (both
+# silently returned nothing under mock, with the calling code's own
+# try/catch masking why), where mocking one custom function is simple
+# and reliable. Returns every running Code.exe process as
+# @{ ProcessId; User }, regardless of owner - Get-VSCodeRunningPidsForUser
+# does the actual filtering.
+function Get-VSCodeProcessOwners {
+  param([string]$ProcessName)
+  $result = @()
+  try {
+    $procs = Get-CimInstance -ClassName Win32_Process -Filter "Name = '$ProcessName'"
+  } catch {
+    return $result
+  }
+  foreach ($p in $procs) {
+    try {
+      $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwner
+      $result += [PSCustomObject]@{ ProcessId = $p.ProcessId; User = $owner.User }
+    } catch {
+      # can't determine this process's owner - skip rather than guess
+    }
+  }
+  return $result
+}
+
+function Get-VSCodeRunningPidsForUser {
+  param([string]$TargetUser)
+  if (-not $TargetUser) { return @() }
+  $owners = Get-VSCodeProcessOwners 'Code.exe'
+  return $owners | Where-Object { $_.User -eq $TargetUser } | ForEach-Object { $_.ProcessId }
+}
+
+# Derives the real GUI Code.exe from the resolved code.cmd CLI path
+# (Find-VSCodeCli) rather than a separate lookup - same install, one
+# directory up: code.cmd lives in "...\Microsoft VS Code\bin\code.cmd",
+# Code.exe in "...\Microsoft VS Code\Code.exe".
+function Get-VSCodeGuiExePath {
+  param([string]$CodePath)
+  $binDir = Split-Path $CodePath -Parent
+  $installDir = Split-Path $binDir -Parent
+  return Join-Path $installDir 'Code.exe'
+}
+
+function Restart-VSCodeIfRunning {
+  param([string]$TargetUser, [string]$CodePath)
+  if (-not $TargetUser) { return $false }
+  $pids = Get-VSCodeRunningPidsForUser $TargetUser
+  if ($pids.Count -eq 0) { return $false }
+
+  foreach ($procId in $pids) {
+    try { Stop-Process -Id $procId -Force -ErrorAction Stop } catch {}
+  }
+
+  $guiExePath = Get-VSCodeGuiExePath $CodePath
+  $taskName = "GlowVSCodeRestart_$([Guid]::NewGuid().ToString('N'))"
+  try {
+    $action = New-ScheduledTaskAction -Execute $guiExePath
+    $principal = New-ScheduledTaskPrincipal -UserId $TargetUser -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force -ErrorAction Stop | Out-Null
+    Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+  } catch {
+    Write-VSCodeDiag "WARN: failed to relaunch VS Code for ${TargetUser}: $_"
+  } finally {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+  }
+  return $true
+}
+
 function Get-VSCodeInstalledExtensionsRaw {
   param([string]$CodePath, [string]$ExtensionsDir)
   return Invoke-VSCodeCli -CodePath $CodePath -ExtensionsDir $ExtensionsDir `
@@ -619,6 +707,15 @@ function Invoke-SetVSCodeExtensionVersion {
 
     $outcome = Get-VSCodeRunOutcome $decision $action $installedVersionAfter $dryRun
 
+    $vscodeRestarted = $false
+    if ($outcome.Status -eq 'success' -and $outcome.Changed -and -not $dryRun) {
+      try {
+        $vscodeRestarted = Restart-VSCodeIfRunning $targetUser.User $codePath
+      } catch {
+        Write-VSCodeDiag "WARN: failed to restart VS Code after version change: $_"
+      }
+    }
+
     $envelope = [PSCustomObject]@{
       os_family                = $Script:OsFamily
       script_version           = $Script:ScriptVersion
@@ -640,6 +737,7 @@ function Invoke-SetVSCodeExtensionVersion {
       user_resolution_note       = $targetUser.ResolutionNote
       os_major_version           = $osMajor
       cli_result                 = (ConvertTo-VSCodeCliResultJson $action)
+      vscode_restarted            = $vscodeRestarted
     }
 
     $json = $envelope | ConvertTo-Json -Compress -Depth 6
