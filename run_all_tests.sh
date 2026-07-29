@@ -110,6 +110,42 @@ run_stage "windows real-world check (windows-remote)" "windows_real_world" \
   "$ROOT_DIR/real_world_check_set_vscode_extension_version.sh" --platform windows-remote \
     --host "$REMOTE_HOST" --user "$REMOTE_USER" "${WIN_AUTH_ARGS[@]}"
 
+# The mocked suites above test lib/ directly (concatenation doesn't change
+# behavior, so that's real coverage) - but js_scripts/dist/ and
+# ps_scripts/dist/ are only actually exercised end-to-end by the two
+# real-world-check stages just above, each of which rebuilds its own dist/
+# from current lib/ sources via its own build_dist step before running.
+# This stage runs last, deliberately after both of those, and does no
+# rebuilding of its own - it just confirms the checked-in top-level
+# dist/mac/ and dist/windows/ (what actually ships) are byte-identical to
+# whatever js_scripts/dist/ and ps_scripts/dist/ were left holding by the
+# stages above (what was actually just built and tested) - catching a
+# shipped dist/ that's silently drifted from what real-world testing
+# verified, e.g. someone ran ./build.sh, edited lib/ again, and forgot to
+# rebuild+recommit.
+check_dist_matches_tested() {
+  local status=0
+  if diff -q "$ROOT_DIR/js_scripts/dist/set-vscode-extension-version.js" \
+             "$ROOT_DIR/dist/mac/set-vscode-extension-version.js" >/dev/null 2>&1; then
+    echo "OK: dist/mac/set-vscode-extension-version.js matches js_scripts/dist/ (the one the mac real-world check just tested)"
+  else
+    echo "FAILED: dist/mac/set-vscode-extension-version.js does not match js_scripts/dist/set-vscode-extension-version.js (the one the mac real-world check just tested) - run ./build.sh and commit the result." >&2
+    diff "$ROOT_DIR/js_scripts/dist/set-vscode-extension-version.js" "$ROOT_DIR/dist/mac/set-vscode-extension-version.js" >&2
+    status=1
+  fi
+  if diff -q "$ROOT_DIR/ps_scripts/dist/Set-VSCodeExtensionVersion.ps1" \
+             "$ROOT_DIR/dist/windows/Set-VSCodeExtensionVersion.ps1" >/dev/null 2>&1; then
+    echo "OK: dist/windows/Set-VSCodeExtensionVersion.ps1 matches ps_scripts/dist/ (the one the windows real-world check just tested)"
+  else
+    echo "FAILED: dist/windows/Set-VSCodeExtensionVersion.ps1 does not match ps_scripts/dist/Set-VSCodeExtensionVersion.ps1 (the one the windows real-world check just tested) - run ./build.sh and commit the result." >&2
+    diff "$ROOT_DIR/ps_scripts/dist/Set-VSCodeExtensionVersion.ps1" "$ROOT_DIR/dist/windows/Set-VSCodeExtensionVersion.ps1" >&2
+    status=1
+  fi
+  return "$status"
+}
+run_stage "dist/ matches what was just built and tested" "dist_matches_tested" \
+  check_dist_matches_tested
+
 echo
 echo "############################################################"
 echo "### Summary"
