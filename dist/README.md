@@ -94,12 +94,14 @@ $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
 ## Test coverage
 
 - **Mocked unit tests** (safe to run anywhere, no real VS Code install or
-  target account needed): 79 on macOS (40 runner + 39 policy), 85 on
+  target account needed): 81 on macOS (42 runner + 39 policy), 85 on
   Windows (46 runner + 39 policy). Each platform's policy module (pure
   decision logic - upgrade vs. downgrade vs. no-op) is tested directly
   under a real interpreter (Node / Pester); each runner module (the OS
   interaction glue) is tested with the single process-invocation seam
-  mocked, so no real process is ever spawned.
+  mocked (two exceptions on macOS, deliberately run for real against the
+  actual process-invocation primitive rather than the mock - see "Bugs
+  found" below), so no real process is ever spawned.
 - **Real-world end-to-end check**: 17 scenarios, shared verbatim between
   both platforms (only *how* each step runs differs), that really
   install/upgrade/downgrade a real, small extension and assert on the
@@ -118,6 +120,15 @@ $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
   a handful of checks are platform-specific, e.g. root-fallback identity
   messaging - see the repo's own `test_logs/` for the exact numbers
   behind any given run).
+- **Verified over a real CrowdStrike Falcon RTR session** (`--platform
+  mac-rtr`), not just invoked locally as the interactive user - the real
+  production deployment channel this script actually ships through:
+  real put-file upload, a real session against a real sensor-enrolled
+  device, real `runscript` invocation and polling. Last full clean run of
+  all 17 scenarios this way: **86 passed, 0 failed**. This is also what
+  surfaced both macOS bugs in the section below - neither was reachable
+  by invoking the same script locally as the interactive user; both
+  needed the real RTR/root execution path to appear at all.
 
 ## Bugs found and fixed via real-hardware verification
 
@@ -160,6 +171,31 @@ purely internal test-harness plumbing):
   side-cache of this suite's fixed pinned test versions, restored into VS
   Code's live cache before each install that needs one, so repeat test
   runs don't depend on that network being healthy every single time.
+- **macOS: a spawned command's timeout was dead code whenever it actually
+  hung** - `code --list-extensions` itself was found stuck (via a live
+  process's own stack sample, main thread parked in Node's own startup)
+  minutes past its configured 20s timeout, real RTR sessions eventually
+  reporting only an opaque "Timed out waiting for script to exit" with no
+  further information. Root cause: the timeout was an `NSTimer` scheduled
+  around a blocking `readDataToEndOfFile` call - `NSTimer` callbacks only
+  ever fire while the run loop is turning, and that blocking read does
+  not pump it, so the timeout could never actually fire while a child
+  stayed hung with its pipe open. Fixed by polling the task's running
+  state against a real wall-clock deadline instead, which has no such
+  dependency - confirmed to correctly kill a genuinely hung process
+  within its configured timeout, both via a direct real-process test and
+  as a permanent regression test.
+- **macOS: an inherited working directory the target user can't access
+  crashes `code`'s own CLI** - a real RTR session `cd`s into its own
+  staging directory (created by root, mode `0700`) before invoking this
+  script; once credentials are dropped to the real target user for the
+  actual `code` CLI call, that user cannot even call `getcwd()` from
+  inside a directory it has zero permission on. This is what the timeout
+  fix above actually surfaced: instead of hanging, the next real run
+  returned a real `EACCES: process.cwd failed` error - and every command
+  this script spawns is now defensively pinned to `/tmp` (`1777`,
+  traversable by any user) rather than trusting whatever directory the
+  calling environment happened to be sitting in.
 
 See the repo root's own `README.md` for full architecture details, and
 `real_world_check_set_vscode_extension_version.sh --help` for every

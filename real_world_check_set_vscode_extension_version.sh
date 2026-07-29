@@ -109,6 +109,18 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Local-only device AIDs / Falcon API credentials for --platform mac-rtr -
+# see .env.local's own header and .gitignore. set -a so FALCON_CLIENT_ID/
+# FALCON_CLIENT_SECRET are actually exported (rtr_token() reads them from
+# the environment), not just set in this shell.
+if [[ -f "$ROOT_DIR/.env.local" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$ROOT_DIR/.env.local"
+  set +a
+fi
+
 EXT_ID="njpwerner.autodocstring"
 # A version distinct from the 0.4.0 used throughout scenarios 1-14, so
 # scenario 16's signature-verification check always exercises a fresh,
@@ -137,6 +149,13 @@ REMOTE=""
 # means run everything. "5" covers both 5a and 5b together - they're one
 # numbered scenario with two cases, not two scenarios.
 ONLY_SCENARIOS=""
+# --platform mac-rtr only: target device AID for the real RTR session
+# (see run_dist_script's mac-rtr override, further down). Falcon API
+# credentials come from FALCON_CLIENT_ID/FALCON_CLIENT_SECRET in the
+# environment only, never a flag here (shell history/process list
+# exposure) - see rtr_token(). Defaults from .env.local's MAC_DEVICE_AID
+# if present, overridable with --device-aid either way.
+DEVICE_AID="${MAC_DEVICE_AID:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -146,8 +165,9 @@ while [[ $# -gt 0 ]]; do
     --key) REMOTE_KEY="$2"; shift 2 ;;
     --password) REMOTE_PASSWORD="$2"; shift 2 ;;
     --scenario) ONLY_SCENARIOS="$ONLY_SCENARIOS $2"; shift 2 ;;
+    --device-aid) DEVICE_AID="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: $0 --platform mac|windows-remote [--host H --user U (--key K | --password P)] [--scenario N ...]"
+      echo "Usage: $0 --platform mac|windows-remote|mac-rtr [--host H --user U (--key K | --password P)] [--device-aid AID] [--scenario N ...]"
       exit 0
       ;;
     *)
@@ -208,6 +228,223 @@ else
   SCP_PREFIX=(scp)
 fi
 
+# ===== RTR (CrowdStrike Falcon) driver, --platform mac-rtr only =====
+#
+# Drives the actual production deployment channel a real Jamf/RTR policy
+# uses - not a stand-in for it: uploads the just-built dist file as a real
+# put-file, opens a real RTR session against a real, sensor-enrolled
+# device, stages the file there, then invokes it there and polls for the
+# result. Mirrors ~/Documents/CodeStation/rtr-put-file-guide.md step for
+# step (that guide's examples are PowerShell/Invoke-RestMethod against a
+# Windows target; this is the same CrowdStrike API flow via curl/python3,
+# invoking `osascript` as the mac target's own shell instead of
+# `powershell`). Only used by run_dist_script's mac-rtr override, further
+# down - everything else (code_cli, GUI session management, assertions,
+# cleanup) is unchanged from plain --platform mac, same machine.
+#
+# Session + put-file are set up ONCE, lazily, on run_dist_script's first
+# call (see RTR_SESSION_ID gating there) and reused for every subsequent
+# call in this run - re-uploading and re-opening a session for every one
+# of this suite's many calls would be needlessly slow and isn't what a
+# real deployment does anyway (one put, one run).
+RTR_API_BASE="${FALCON_BASE:-https://api.us-2.crowdstrike.com}"
+RTR_PUT_NAME="set-vscode-extension-version-rtr-check.js"
+RTR_REMOTE_DIR="/tmp/glow_rwc_rtr"
+RTR_REMOTE_PATH="$RTR_REMOTE_DIR/$RTR_PUT_NAME"
+RTR_SESSION_ID=""
+RTR_TOKEN=""
+
+# Mints a bearer token from FALCON_CLIENT_ID/FALCON_CLIENT_SECRET - read
+# from the environment only. Never accept these as CLI flags: argv is
+# visible in shell history and to any other process on the machine via
+# `ps`, exactly the exposure rtr-put-file-guide.md itself warns against
+# ("pull it from Credential Manager/Keychain at runtime instead").
+rtr_token() {
+  if [[ -z "${FALCON_CLIENT_ID:-}" || -z "${FALCON_CLIENT_SECRET:-}" ]]; then
+    echo "Error: --platform mac-rtr requires FALCON_CLIENT_ID and FALCON_CLIENT_SECRET in the environment" >&2
+    exit 1
+  fi
+  RTR_TOKEN="$(curl -sf -X POST "$RTR_API_BASE/oauth2/token" \
+    -d "client_id=$FALCON_CLIENT_ID" -d "client_secret=$FALCON_CLIENT_SECRET" \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin).get("access_token") or "")')"
+  if [[ -z "$RTR_TOKEN" ]]; then
+    echo "Error: could not mint a Falcon API bearer token - check FALCON_CLIENT_ID/FALCON_CLIENT_SECRET" >&2
+    exit 1
+  fi
+}
+
+# $1 = HTTP method, $2 = path (from the API root), remaining args passed
+# straight to curl (headers, -d body, -F form fields, ...).
+rtr_api() {
+  local method="$1" path="$2"; shift 2
+  curl -sf -X "$method" "$RTR_API_BASE$path" -H "Authorization: Bearer $RTR_TOKEN" "$@"
+}
+
+# Clears any stale put-file already in the cloud inventory under this same
+# name (e.g. left behind by an interrupted earlier run) before uploading
+# a fresh one - an upload doesn't overwrite an existing entry with the
+# same name, it just adds another one, so a run's own newest build could
+# otherwise not be the one that actually gets staged.
+rtr_clear_stale_put_file() {
+  local ids id
+  ids="$(rtr_api GET "/real-time-response/queries/put-files/v1?filter=name:'$RTR_PUT_NAME'" \
+    | python3 -c 'import json, sys; print(" ".join(json.load(sys.stdin).get("resources") or []))')"
+  for id in $ids; do
+    rtr_api DELETE "/real-time-response/entities/put-files/v1?ids=$id" >/dev/null
+  done
+}
+
+rtr_upload_put_file() {
+  rtr_api POST "/real-time-response/entities/put-files/v1" \
+    -F "name=$RTR_PUT_NAME" \
+    -F "description=vscode_extension_manager real-world check" \
+    -F "comments_for_audit_log=automated real-world check (mac-rtr)" \
+    -F "file=@$DIST_SCRIPT" >/dev/null
+}
+
+rtr_open_session() {
+  local resp
+  resp="$(rtr_api POST "/real-time-response/entities/sessions/v1" \
+    -H "Content-Type: application/json" \
+    -d "$(python3 -c 'import json, sys; print(json.dumps({"device_id": sys.argv[1], "origin": "adhoc", "queue_offline": False}))' "$DEVICE_AID")")"
+  RTR_SESSION_ID="$(printf '%s' "$resp" | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin)["resources"][0]["session_id"])
+except Exception:
+    print("")')"
+  if [[ -z "$RTR_SESSION_ID" ]]; then
+    echo "Error: could not open an RTR session against device $DEVICE_AID: $resp" >&2
+    exit 1
+  fi
+}
+
+# $1 = base_command (e.g. "cd", "put", "runscript"), $2 = command_string.
+# Polls until the cloud_request_id reports complete, same as the guide's
+# own Send-Rtr helper. Prints the raw JSON of the final admin-command GET
+# (the caller pulls stdout/stderr/complete out of that itself).
+rtr_send() {
+  local base_command="$1" command_string="$2" resp crid waited=0 g complete
+  resp="$(rtr_api POST "/real-time-response/entities/admin-command/v1" \
+    -H "Content-Type: application/json" \
+    -d "$(python3 -c 'import json, sys; print(json.dumps({"base_command": sys.argv[1], "command_string": sys.argv[2], "session_id": sys.argv[3], "persist": True}))' "$base_command" "$command_string" "$RTR_SESSION_ID")")"
+  crid="$(printf '%s' "$resp" | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin)["resources"][0]["cloud_request_id"])
+except Exception:
+    print("")')"
+  if [[ -z "$crid" ]]; then
+    echo "Error: RTR command ($base_command) did not return a cloud_request_id: $resp" >&2
+    exit 1
+  fi
+  while true; do
+    sleep 3
+    waited=$((waited + 3))
+    g="$(rtr_api GET "/real-time-response/entities/admin-command/v1?cloud_request_id=$crid&sequence_id=0")"
+    complete="$(printf '%s' "$g" | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin)["resources"][0].get("complete"))
+except Exception:
+    print("False")')"
+    [[ "$complete" == "True" ]] && break
+    # 240s, not 120: comfortably longer than the invoked runscript's own
+    # -Timeout=180 (see rtr_run_dist_script) - this loop must never give
+    # up before RTR's own server-side timeout would, or a slow-but-still-
+    # running real install gets misreported as our own polling failure
+    # instead of RTR's real timeout error.
+    if [[ $waited -ge 240 ]]; then
+      echo "Error: RTR command ($base_command) did not complete within 240s (cloud_request_id=$crid)" >&2
+      exit 1
+    fi
+  done
+  printf '%s' "$g"
+}
+
+# $1 = command's JSON response (from rtr_send), $2 = field name
+# ("stdout"/"stderr"/"complete") - small helper so rtr_run_dist_script
+# doesn't repeat the same try/except JSON-field pull four times.
+rtr_field() {
+  printf '%s' "$1" | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin)["resources"][0].get(sys.argv[1]) or "")
+except Exception:
+    print("")' "$2"
+}
+
+# The mac-rtr override for run_dist_script (see the mac case branch below,
+# which reassigns run_dist_script to call this). Lazily does the one-time
+# put-file upload + session open + staging on its FIRST call (gated on
+# RTR_SESSION_ID being empty), then on every call (including that first
+# one) actually invokes the staged script via `runscript -Raw=` and
+# returns its stdout - exactly what run_dist_script's other
+# implementations (direct osascript, SSH) already return, so none of the
+# scenario logic that calls run_dist_script needs to know or care that
+# this one goes over the network to a real CrowdStrike session.
+rtr_run_dist_script() {
+  local payload="$1"
+  if [[ -z "$RTR_SESSION_ID" ]]; then
+    echo "==> [mac-rtr] Minting Falcon API token" >&2
+    rtr_token
+    echo "==> [mac-rtr] Clearing any stale put-file named $RTR_PUT_NAME" >&2
+    rtr_clear_stale_put_file
+    echo "==> [mac-rtr] Uploading $DIST_SCRIPT as a put-file" >&2
+    rtr_upload_put_file
+    echo "==> [mac-rtr] Opening an RTR session against device $DEVICE_AID" >&2
+    rtr_open_session
+    echo "==> [mac-rtr] Staging the script onto the target disk" >&2
+    rtr_send "runscript" 'runscript -Raw=```mkdir -p '"$RTR_REMOTE_DIR"'```' >/dev/null
+    rtr_send "cd" "cd $RTR_REMOTE_DIR" >/dev/null
+    # `put` refuses to overwrite an existing file ("File exists and
+    # overwrite not requested") - confirmed real: a leftover from an
+    # earlier interrupted run silently left this run invoking a STALE
+    # script instead of what was just built, since `put`'s own stderr was
+    # only ever warned about, never treated as fatal. Force a clean slate
+    # first, every time.
+    rtr_send "runscript" 'runscript -Raw=```rm -f "'"$RTR_REMOTE_PATH"'"```' >/dev/null
+    local put_resp put_err
+    put_resp="$(rtr_send "put" "put \"$RTR_PUT_NAME\"")"
+    put_err="$(rtr_field "$put_resp" stderr)"
+    [[ -n "$put_err" ]] && echo "  WARNING: [mac-rtr] put reported stderr: $put_err" >&2
+    # Check it actually landed before ever invoking it - a silently failed
+    # put (wrong session cwd, name typo, stale inventory entry) would
+    # otherwise only surface later as a confusing file-not-found (see the
+    # guide's own "check it actually landed" step).
+    local check_resp check_out
+    check_resp="$(rtr_send "runscript" 'runscript -Raw=```test -f "'"$RTR_REMOTE_PATH"'" && echo FOUND || echo MISSING```')"
+    check_out="$(rtr_field "$check_resp" stdout | tr -d '[:space:]')"
+    if [[ "$check_out" != "FOUND" ]]; then
+      echo "Error: [mac-rtr] put didn't stage the file at $RTR_REMOTE_PATH - stop before invoking" >&2
+      exit 1
+    fi
+  fi
+
+  local invoke_cmd resp out err
+  # No trailing -Timeout= here (an earlier version appended one) -
+  # confirmed via direct isolated testing that this exact -Raw= form,
+  # unmodified, actually completes and returns a real envelope; adding an
+  # unverified -Timeout= suffix after the closing triple-backticks is what
+  # produced a real "Timed out waiting for script to exit" instead.
+  invoke_cmd='runscript -Raw=```osascript -l JavaScript "'"$RTR_REMOTE_PATH"'" "'"$payload"'"```'
+  resp="$(rtr_send "runscript" "$invoke_cmd")"
+  out="$(rtr_field "$resp" stdout)"
+  err="$(rtr_field "$resp" stderr)"
+  [[ -n "$err" ]] && echo "  WARNING: [mac-rtr] runscript reported stderr: $err" >&2
+  printf '%s' "$out"
+}
+
+# The mac-rtr override for cleanup_deployed_script - closes the real RTR
+# session (mirroring the guide's own step 5) and clears the put-file from
+# the cloud inventory, so a finished run doesn't leave either behind.
+# Guarded (never lets set -e propagate a failure here): this runs from
+# inside restore_original_state's EXIT trap, where the far more important
+# step is restoring the extension's own original install state, not
+# tidying up the RTR side.
+rtr_cleanup_deployed_script() {
+  if [[ -n "$RTR_SESSION_ID" ]]; then
+    rtr_api DELETE "/real-time-response/entities/sessions/v1?session_id=$RTR_SESSION_ID" >/dev/null 2>&1 || true
+  fi
+  rtr_clear_stale_put_file 2>/dev/null || true
+}
+
 # ===== Platform dispatch =====
 #
 # Each platform branch below defines the same set of primitives the
@@ -233,7 +470,7 @@ fi
 #   REAL_USER, IS_ROOT          - identity concepts scenario 5 depends on
 #   NO_SUCH_USER_PATH           - extension_path naming a nonexistent user
 case "$PLATFORM" in
-  mac)
+  mac | mac-rtr)
     CODE_BIN="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
     DIST_SCRIPT="$ROOT_DIR/js_scripts/dist/set-vscode-extension-version.js"
     # Under sudo, $(whoami) reports "root" (the effective user), not the
@@ -308,6 +545,21 @@ case "$PLATFORM" in
     # a normal build artifact, not a temp file needing cleanup (unlike the
     # windows-remote branch's copy under the remote %TEMP%).
     cleanup_deployed_script() { :; }
+    # mac-rtr: identical to mac in every other way (same machine, same
+    # code_cli/GUI-session/assertion/cleanup functions above and below) -
+    # only how the deployed script is actually invoked differs. build_dist
+    # is deliberately left untouched (still just the local build - see the
+    # top-of-file usage comment): all the RTR-specific work (upload,
+    # session, staging) lives inside rtr_run_dist_script itself, lazily,
+    # on its first call.
+    if [[ "$PLATFORM" == "mac-rtr" ]]; then
+      if [[ -z "$DEVICE_AID" ]]; then
+        echo "Error: --platform mac-rtr requires --device-aid <AID>" >&2
+        exit 1
+      fi
+      run_dist_script() { rtr_run_dist_script "$1"; }
+      cleanup_deployed_script() { rtr_cleanup_deployed_script; }
+    fi
     setup_symlink_scenario() {
       mkdir -p "$SYMLINK_TARGET"
       rm -f "$SYMLINK_PATH"
@@ -1030,7 +1282,7 @@ PS
     }
     ;;
   *)
-    echo "Error: --platform must be 'mac' or 'windows-remote'" >&2
+    echo "Error: --platform must be 'mac', 'mac-rtr', or 'windows-remote'" >&2
     exit 1
     ;;
 esac
@@ -1338,11 +1590,15 @@ trap restore_original_state EXIT
 # specifically. Relaunched at the very end (see restore_original_state
 # above) if it really was running before this script started.
 if vscode_gui_session_running; then
+  echo "==> [DIAG] pre-test setup: VS Code pids before any action = $(get_vscode_pids)"
   if real_gui_session_available; then
+    echo "==> [DIAG] pre-test setup: no unsaved buffers detected - about to call kill_vscode_gui_session"
     echo "==> Closing the already-running VS Code session for the duration of scenarios 1-16"
     kill_vscode_gui_session
+    echo "==> [DIAG] pre-test setup: VS Code pids after kill_vscode_gui_session = $(get_vscode_pids)"
     PRE_TEST_VSCODE_CLOSED_BY_US=true
   else
+    echo "==> [DIAG] pre-test setup: unsaved buffers detected - leaving the running session alone"
     echo "==> VS Code is running but not safe to close (unsaved buffers) - scenarios 1-16 will also trigger the restart-after-change feature as a side effect this run; not a failure, just noisier/slower"
   fi
 fi

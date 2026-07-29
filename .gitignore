@@ -9,3 +9,7 @@ ps_scripts/dist/
 
 # Test run logs (see run_all_tests.sh)
 test_logs/
+
+# Local-only RTR credentials/device AIDs (see run_all_tests.sh --rtr) -
+# never commit real Falcon API credentials.
+.env.local

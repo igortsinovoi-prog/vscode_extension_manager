@@ -70,7 +70,18 @@ afterward without re-running anything.
 ```bash
 ./run_all_tests.sh --host <windows-ip> --user <windows-user> --password <pw>
 sudo ./run_all_tests.sh --host <windows-ip> --user <windows-user> --password <pw>   # + mac root-fallback coverage
+
+# + real-RTR stages (see "Testing via real RTR" below):
+./run_all_tests.sh --host <ip> --user <user> --password <pw> --rtr --device-aid <aid>
 ```
+
+Pass `--rtr` to also run the real-world checks over an actual CrowdStrike
+Falcon RTR session (`--platform mac-rtr`) - additive, not a replacement:
+the direct-invocation real-world checks above still run every time. See
+"Testing via real RTR" under "Real-world check" below for what this
+needs and why it exists. `windows-rtr` isn't implemented yet; `--rtr`
+prints a note and skips it rather than pretending to run something that
+doesn't exist.
 
 ## Real-world check (shared, both platforms)
 
@@ -93,6 +104,9 @@ sudo ./real_world_check_set_vscode_extension_version.sh --platform mac   # + roo
   --host <ip> --user <admin-user> --key ~/.ssh/id_ed25519   # key auth
 ./real_world_check_set_vscode_extension_version.sh --platform windows-remote \
   --host <ip> --user <admin-user> --password <pw>           # or password auth (needs sshpass)
+
+./real_world_check_set_vscode_extension_version.sh --platform mac-rtr \
+  --device-aid <aid>   # + FALCON_CLIENT_ID/SECRET in env or .env.local - see "Testing via real RTR" below
 ```
 
 It captures the extension's original install state up front and restores
@@ -100,6 +114,42 @@ it on exit regardless of pass/fail - each cleanup step is guarded
 independently, so one step erroring (e.g. a transient SSH hiccup) can
 never block the far more important step of restoring the extension's
 original install state.
+
+### Testing via real RTR (`--platform mac-rtr`)
+
+The direct-invocation `--platform mac` above runs the deployed script
+locally, as the interactive user - a genuinely different code path from
+how this actually ships in production (a CrowdStrike Falcon RTR
+`runscript` invocation, running as root against whatever session happens
+to be logged in). `--platform mac-rtr` drives that real path instead:
+real put-file upload, a real RTR session against a real sensor-enrolled
+device, real `runscript` invocation and polling - self-targeting this
+same Mac. This is not redundant with `--platform mac`: it's what actually
+surfaced two real macOS bugs neither direct invocation nor the mocked
+suites ever could (an inherited working directory the target user can't
+access, and a spawned command's timeout that could never actually fire -
+see `dist/README.md`'s "Bugs found" for both). `windows-rtr` doesn't
+exist yet.
+
+```bash
+FALCON_CLIENT_ID=... FALCON_CLIENT_SECRET=... \
+./real_world_check_set_vscode_extension_version.sh --platform mac-rtr \
+  --device-aid <sensor-enrolled-device-aid>
+```
+
+Needs `--device-aid` (the target device) and `FALCON_CLIENT_ID`/
+`FALCON_CLIENT_SECRET` in the environment - **never as flags**: argv is
+visible in shell history and to any other process on the machine via
+`ps` (see `rtr_token()`'s own comment). Both can instead live in a local,
+git-ignored `.env.local` at the repo root (`MAC_DEVICE_AID=...`,
+`FALCON_CLIENT_ID=...`, `FALCON_CLIENT_SECRET=...`) - auto-loaded by both
+this script and `run_all_tests.sh --rtr` if present, so a real RTR run
+doesn't need any of that re-entered by hand each time. Recover a device
+AID from the Falcon console (Host Management) or the Falcon API's own
+`devices-scroll` query filtered by hostname/serial number; recover the
+API credentials from wherever your team keeps them - neither is
+derivable from anything else in this repo, and `.env.local` is never
+committed.
 
 `--platform windows-remote` drives everything from the Mac side over SSH
 to an admin account on the Windows box: `bootstrap_remote_windows.ps1`

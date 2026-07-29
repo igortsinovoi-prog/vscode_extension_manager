@@ -34,6 +34,16 @@ function println(msg) {
 eval(readFile('js_scripts/lib/set-vscode-extension-version-policy.js'));
 eval(readFile('js_scripts/lib/set-vscode-extension-version-runner.js'));
 
+// Every other test in this file mocks _runCommand out entirely (see
+// resetMocks() below) - it's the seam, not something exercised for real.
+// But _runCommand's own real implementation has two real, previously
+// reproduced-in-production bugs fixed in it (a dead timeout, and a
+// working-directory permission crash), neither of which had any
+// permanent regression test before now. Captured here, before any test()
+// call has a chance to run resetMocks() and overwrite the global
+// _runCommand binding with the mock.
+var realRunCommand = _runCommand;
+
 // ----- Minimal assert/test framework -----
 
 function assertEqual(actual, expected, message) {
@@ -191,10 +201,10 @@ function standardMockRunCommand(launchPath, args, timeoutSec) {
       stderr: '',
     };
   }
-  if (launchPath === '/bin/launchctl' && args[0] === 'asuser' && args[2] === '/usr/bin/sudo' && args[5] === '/usr/bin/osascript') {
+  if (launchPath === '/bin/launchctl' && args[0] === 'asuser' && args[2] === '/usr/bin/sudo' && args[6] === '/usr/bin/osascript') {
     return { exitCode: 0, stdout: '', stderr: '' };
   }
-  if (launchPath === '/bin/launchctl' && args[0] === 'asuser' && args[2] === '/usr/bin/sudo' && args[5] === '/usr/bin/open') {
+  if (launchPath === '/bin/launchctl' && args[0] === 'asuser' && args[2] === '/usr/bin/sudo' && args[6] === '/usr/bin/open') {
     return { exitCode: 0, stdout: '', stderr: '' };
   }
   if (launchPath === '/bin/sleep') {
@@ -212,6 +222,53 @@ function makeArgv(paramsObj, dryRun) {
 }
 
 var JDOE_PATH = '/Users/jdoe/.vscode/extensions/ms-python.python-2024.1.0';
+
+// ---------------------------------------------------------------------------
+// _runCommand (real, unmocked - see realRunCommand above) - two real bugs
+// reproduced and fixed against actual RTR runs, neither previously covered
+// by any automated test since every other test here mocks this out.
+// ---------------------------------------------------------------------------
+
+test('_runCommand: a real hang is killed within its timeout, not left to run forever', function () {
+  // /bin/sleep 100 blocks for a fixed duration regardless of stdio (unlike
+  // e.g. /bin/cat, whose blocking-on-stdin behavior turned out to depend
+  // on what the launching harness's own stdin happened to be wired to -
+  // not deterministic enough for a test) - a reliable local stand-in for
+  // the real RTR hang this is guarding against (that one was in `code`'s
+  // own IPC handoff, not reproducible outside a real RTR session - see
+  // the runner's own _runCommand comment). Old implementation: NSTimer
+  // scheduled around a blocking readDataToEndOfFile never fired because
+  // that read doesn't pump the run loop - confirmed via a live stuck
+  // production process's own stack sample, main thread parked in exactly
+  // that call, minutes past its configured timeout. New implementation
+  // polls task.isRunning against a real wall-clock deadline instead,
+  // which has no such dependency.
+  var start = Date.now();
+  var result = realRunCommand('/bin/sleep', ['100'], 1);
+  var elapsedSec = (Date.now() - start) / 1000;
+  assertTrue(elapsedSec < 5, 'expected termination well within a few seconds of the 1s timeout, took ' + elapsedSec + 's');
+  assertTrue(result.exitCode !== 0, 'expected a non-zero exit code from a terminated process, got ' + result.exitCode);
+});
+
+test('_runCommand: pins the working directory to /tmp, immune to an inaccessible caller cwd', function () {
+  // Real production failure: an RTR run `cd`s into its own staging
+  // directory (root-created, mode 0700) before invoking this script;
+  // once runCode's sudo -H -u '#uid' drops to the target user inside
+  // that inherited cwd, that user can't even call getcwd() from a
+  // directory it has zero permission on - confirmed via a real envelope:
+  // "Error: EACCES: process.cwd failed with error permission denied,
+  // uv_cwd". This doesn't need to recreate that exact root/uid privilege
+  // scenario to verify the actual fix, which is unconditional: assert
+  // /bin/pwd (run for real, no mocking) reports /tmp specifically,
+  // proving currentDirectoryPath is set rather than left as whatever
+  // this test process itself happens to be sitting in. /private/tmp, not
+  // /tmp: pwd reports the physical path, and /tmp is itself a symlink to
+  // /private/tmp on macOS - setting currentDirectoryPath to '/tmp' is
+  // still correct, this is just what a real child process resolves it to.
+  var result = realRunCommand('/bin/pwd', [], 5);
+  assertEqual(result.exitCode, 0, 'expected /bin/pwd to succeed');
+  assertEqual(result.stdout.trim(), '/private/tmp', 'expected the child to report /tmp (resolved) as its cwd regardless of the caller\'s own cwd');
+});
 
 // ---------------------------------------------------------------------------
 // resolveTargetUser
@@ -367,7 +424,7 @@ test('restartVSCodeIfRunning: not running -> no quit/relaunch attempted, returns
   var result = restartVSCodeIfRunning(501);
   assertEqual(result, false);
   var quitCalls = commandLog.filter(function (c) {
-    return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[5] === '/usr/bin/osascript';
+    return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[6] === '/usr/bin/osascript';
   });
   assertEqual(quitCalls.length, 0);
 });
@@ -380,18 +437,18 @@ test('restartVSCodeIfRunning: running, quits promptly -> quits then relaunches a
   assertEqual(result, true);
 
   var quitCall = commandLog.filter(function (c) {
-    return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[5] === '/usr/bin/osascript';
+    return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[6] === '/usr/bin/osascript';
   });
   assertEqual(quitCall.length, 1);
   assertEqual(quitCall[0].args[1], String(501));
-  assertEqual(quitCall[0].args[4], '#501'); // sudo -u '#uid' - real credentials, not just the bootstrap namespace
+  assertEqual(quitCall[0].args[5], '#501'); // sudo -u '#uid' - real credentials, not just the bootstrap namespace
 
   var openCall = commandLog.filter(function (c) {
-    return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[5] === '/usr/bin/open';
+    return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[6] === '/usr/bin/open';
   });
   assertEqual(openCall.length, 1);
   assertEqual(openCall[0].args[1], String(501));
-  assertEqual(openCall[0].args.slice(6), ['-a', 'Visual Studio Code']);
+  assertEqual(openCall[0].args.slice(7), ['-a', 'Visual Studio Code']);
 });
 
 test('restartVSCodeIfRunning: still running after the wait loop -> force-kills by pid, then relaunches anyway', function () {
@@ -403,7 +460,7 @@ test('restartVSCodeIfRunning: still running after the wait loop -> force-kills b
   assertEqual(result, true);
   assertEqual(killLog, [{ pid: 12345, sig: 9 }]);
   var openCall = commandLog.filter(function (c) {
-    return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[5] === '/usr/bin/open';
+    return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[6] === '/usr/bin/open';
   });
   assertEqual(openCall.length, 1);
 });
@@ -559,7 +616,7 @@ test('run(): differing version, real run, VS Code already running -> restarts it
     assertEqual(result.vscode_restarted, true);
 
     var quitCall = commandLog.filter(function (c) {
-      return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[5] === '/usr/bin/osascript';
+      return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[6] === '/usr/bin/osascript';
     });
     assertEqual(quitCall.length, 1);
     assertEqual(quitCall[0].args[1], '501');
@@ -577,7 +634,7 @@ test('run(): already at the target version (no change) -> never attempts a resta
     assertEqual(result.status, 'skipped');
     assertEqual(result.vscode_restarted, false);
     var quitCall = commandLog.filter(function (c) {
-      return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[5] === '/usr/bin/osascript';
+      return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[6] === '/usr/bin/osascript';
     });
     assertEqual(quitCall.length, 0);
   });
@@ -595,7 +652,7 @@ test('run(): dry run with a pending change -> never attempts a restart even if V
     assertEqual(result.dry_run, true);
     assertEqual(result.vscode_restarted, false);
     var quitCall = commandLog.filter(function (c) {
-      return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[5] === '/usr/bin/osascript';
+      return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[6] === '/usr/bin/osascript';
     });
     assertEqual(quitCall.length, 0);
   });

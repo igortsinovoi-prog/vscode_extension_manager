@@ -64,6 +64,7 @@ var DIAG_FILE      = '/tmp/glow/rtr.txt';
 
 var DEFAULT_CMD_TIMEOUT_SEC = 20;
 var SIGKILL_GRACE_SEC       = 2;
+var POLL_INTERVAL_SEC       = 0.1;
 // Installing/upgrading an extension downloads a VSIX over the network -
 // give it much longer than a quick local command before we give up.
 var INSTALL_CMD_TIMEOUT_SEC = 120;
@@ -182,41 +183,93 @@ function resolveSafe(path) {
 // NSFileHandle reads instead of a pipe read up front; that silently
 // returned empty stdout even on a successful, fast command like `id -u` -
 // this pipe-based approach is verified to actually work.)
+// Polls task.isRunning against a real wall-clock deadline instead of
+// scheduling an NSTimer around a blocking readDataToEndOfFile - the
+// previous approach. CONFIRMED real and reproduced (not just theorized):
+// under a real RTR-invoked run, `code --list-extensions` never returned;
+// the live stuck process's own stack sample showed the main thread still
+// blocked inside readDataToEndOfFile minutes past its configured 20s
+// timeout, with the scheduled kill timer never having fired. NSTimer
+// callbacks only ever run while the run loop is turning, and a
+// synchronous blocking read does not pump it - so that timeout was dead
+// code whenever the child stalled with its pipe still open.
+//
+// This fix alone (before the working-directory fix below existed) is
+// what surfaced the actual root cause: instead of hanging forever, the
+// next real run returned a real error - `code`'s own Node startup
+// hitting EACCES on process.cwd() (see the currentDirectoryPath
+// assignment's own comment) - which apparently sent it into exactly the
+// stuck-in-startup state the stack sample had shown, rather than a clean
+// fast exit. With both fixes in place, a full real-world suite run
+// against actual RTR passed end to end. Kept as a poll loop rather than
+// reverted now that the cause is understood: this class of "the child
+// hangs instead of failing fast" behavior is a real thing Node/Electron
+// can do, and this function has no way to know in advance it won't
+// happen again for some other reason.
+//
+// Deliberately does not drain the pipe incrementally during the poll:
+// Date.now()/task.isRunning/task.terminate/$.kill are all independent of
+// pipe I/O, so this loop reliably detects and kills a hang no matter
+// what's sitting in the pipe. The one accepted tradeoff: if a child
+// writes enough combined stdout+stderr to fill the OS pipe buffer
+// (~64KB) before exiting, it blocks on its own write() with nobody
+// draining the read end, so isRunning stays true until this loop's own
+// timeout forcibly kills it - slower than incremental draining would be,
+// but still bounded and correct, and no command in this file ever
+// approaches that volume.
 function _runCommand(launchPath, args, timeoutSec) {
   var timeout = timeoutSec || DEFAULT_CMD_TIMEOUT_SEC;
+  var cmdDesc = launchPath + ' ' + (args ? args.join(' ') : '');
+  writeDiag('_runCommand: starting [' + cmdDesc + '] timeout=' + timeout + 's');
   try {
     var task = $.NSTask.alloc.init;
     task.launchPath = launchPath;
     if (args) task.arguments = args;
+    // Never trust the inherited working directory - CONFIRMED real via
+    // the actual error this was chasing: an RTR run `cd`s into its own
+    // staging directory (root-created, mode 0700) before invoking this
+    // script; a child spawned here would inherit that same cwd, and once
+    // runCode's sudo -H -u '#uid' drops it to the target user, that user
+    // can no longer even call getcwd() from inside a directory it has
+    // zero permission on - Node/the CLI (and even sudo's own shell-init)
+    // failed immediately with EACCES. /tmp is mode 1777 (sticky,
+    // world-traversable) - accessible to any uid regardless of whatever
+    // directory the caller happened to be sitting in.
+    task.currentDirectoryPath = '/tmp';
     var pipe = $.NSPipe.pipe;
     task.standardOutput = pipe;
     task.standardError  = pipe;
     task.launch;
 
     var pid = task.processIdentifier;
-    var killTimer = $.NSTimer.scheduledTimerWithTimeIntervalRepeatsBlock(
-      timeout, false, function () {
+    writeDiag('_runCommand: launched pid=' + pid + ' [' + cmdDesc + ']');
+
+    var deadline     = Date.now() + timeout * 1000;
+    var hardDeadline = deadline + SIGKILL_GRACE_SEC * 1000;
+    var terminated   = false;
+    while (task.isRunning) {
+      var now = Date.now();
+      if (!terminated && now >= deadline) {
+        writeDiag('_runCommand: timeout reached (' + timeout + 's), terminating pid=' + pid + ' [' + cmdDesc + ']');
         try { task.terminate; } catch (_) {}
-      }
-    );
-    var hardKill = $.NSTimer.scheduledTimerWithTimeIntervalRepeatsBlock(
-      timeout + SIGKILL_GRACE_SEC, false, function () {
+        terminated = true;
+      } else if (terminated && now >= hardDeadline) {
+        writeDiag('_runCommand: still running ' + SIGKILL_GRACE_SEC + 's after terminate, SIGKILL pid=' + pid + ' [' + cmdDesc + ']');
         try { $.kill(pid, 9); } catch (_) {}
       }
-    );
+      $.NSThread.sleepForTimeInterval(POLL_INTERVAL_SEC);
+    }
 
-    // Read before waitUntilExit: readDataToEndOfFile blocks until the
-    // pipe's write end closes (i.e. the child exits), so reading first is
-    // safe and avoids the fill-the-buffer-before-anyone-reads deadlock that
-    // reading only *after* waitUntilExit would risk.
+    writeDiag('_runCommand: task no longer running, pid=' + pid + ' - reading output');
     var outData = pipe.fileHandleForReading.readDataToEndOfFile;
+    writeDiag('_runCommand: readDataToEndOfFile returned, pid=' + pid + ' - calling waitUntilExit');
     task.waitUntilExit;
-    if (killTimer.isValid) killTimer.invalidate;
-    if (hardKill.isValid)  hardKill.invalidate;
+    writeDiag('_runCommand: waitUntilExit returned, pid=' + pid + ' exitCode=' + task.terminationStatus);
 
     var out = _dataToString(outData);
     return { exitCode: task.terminationStatus, stdout: out, stderr: out };
   } catch (e) {
+    writeDiag('_runCommand: EXCEPTION [' + cmdDesc + ']: ' + e);
     return { exitCode: -1, stdout: '', stderr: String(e) };
   }
 }
@@ -379,12 +432,16 @@ function restoreSignatureVerification(state) {
 // only for this one invocation and always restored afterward, success or
 // failure (see enableSignatureBypass/restoreSignatureVerification).
 function runCode(uid, user, args, timeoutSec) {
+  writeDiag('runCode: entry, uid=' + uid + ' user=' + user + ' args=[' + (args || []).join(' ') + ']');
   var settingsPath = getSettingsPath(uid, user);
   var bypassState = enableSignatureBypass(settingsPath, uid);
+  writeDiag('runCode: signature bypass applied=' + (bypassState && bypassState.applied));
   try {
     if (uid === null) {
       var rootArgs = ['HOME=/var/root', VSCODE.codePath].concat(args);
-      return _runCommand('/usr/bin/env', rootArgs, timeoutSec);
+      var rootResult = _runCommand('/usr/bin/env', rootArgs, timeoutSec);
+      writeDiag('runCode: root-fallback _runCommand returned exitCode=' + rootResult.exitCode);
+      return rootResult;
     }
     // `launchctl asuser` only attaches this process to the target user's
     // Mach bootstrap namespace/session (needed so `code` can reach the
@@ -400,9 +457,13 @@ function runCode(uid, user, args, timeoutSec) {
     // reporting target_user. `#uid` (not the username) so this works even
     // when only a numeric uid was resolved.
     var fullArgs = ['asuser', String(uid), '/usr/bin/sudo', '-H', '-u', '#' + uid, VSCODE.codePath].concat(args);
-    return _runCommand('/bin/launchctl', fullArgs, timeoutSec);
+    var result = _runCommand('/bin/launchctl', fullArgs, timeoutSec);
+    writeDiag('runCode: launchctl asuser _runCommand returned exitCode=' + result.exitCode);
+    return result;
   } finally {
+    writeDiag('runCode: restoring signature verification state');
     restoreSignatureVerification(bypassState);
+    writeDiag('runCode: exit');
   }
 }
 
@@ -447,31 +508,70 @@ function findRunningVSCodePids(uid) {
 // mocked test run would send a real SIGKILL to whatever real PID happens
 // to match.
 function killPid(pid, sig) {
-  try { $.kill(pid, sig); } catch (e) { /* best-effort */ }
+  try {
+    $.kill(pid, sig);
+    writeDiag('killPid: sent signal ' + sig + ' to pid ' + pid);
+  } catch (e) {
+    writeDiag('killPid: FAILED to signal pid ' + pid + ' with signal ' + sig + ': ' + e);
+  }
 }
 
+// Deliberately verbose diagnostic tracing (writeDiag, not just the odd
+// WARN like elsewhere in this file). Kept permanently, not trimmed back
+// after the investigation that added it closed out: this RTR/root
+// execution path has repeatedly proven far harder to reason about than
+// the same commands run locally as the real user (see _runCommand's own
+// comment for two confirmed, previously invisible failures found this
+// way - a dead timeout and an inherited-cwd permission crash), so every
+// step here is logged with the pids observed and each spawned command's
+// exitCode/stdout/stderr. A real RTR run's own /tmp/glow/rtr.txt (this
+// machine, since --platform mac-rtr targets itself) shows exactly which
+// step did what - in particular, whether the quit AppleEvent or the
+// killPid force-kill actually reduced pids to zero before the
+// unconditional `open -a` below ever runs.
 function restartVSCodeIfRunning(uid) {
   if (uid === null) return false;
-  if (findRunningVSCodePids(uid).length === 0) return false;
+  var pidsBefore = findRunningVSCodePids(uid);
+  writeDiag('restartVSCodeIfRunning: pids before anything = [' + pidsBefore.join(',') + ']');
+  if (pidsBefore.length === 0) return false;
 
   // See runCode's own comment: `launchctl asuser` alone does not drop this
   // process' credentials, only its Mach bootstrap namespace - layering
-  // `sudo -u '#uid'` inside that context is what actually makes these
+  // `sudo -H -u '#uid'` inside that context is what actually makes these
   // AppleEvents originate as the real target user (matching that user's
   // own previously-granted Automation/TCC permissions) instead of root's.
-  _runCommand('/bin/launchctl', ['asuser', String(uid), '/usr/bin/sudo', '-u', '#' + uid, '/usr/bin/osascript', '-e', 'quit app "Visual Studio Code"']);
+  // -H matters here same as in runCode: without it, HOME stays whatever
+  // this process' own euid's home is (root's /var/root under a real
+  // root/RTR invocation) - confirmed real: the relaunched VS Code GUI
+  // itself then can't find its own user data or keychain ("Unable to
+  // write program user data", "Keychain Not Found"), and shows real
+  // blocking dialogs on screen instead of just working.
+  var quitResult = _runCommand('/bin/launchctl', ['asuser', String(uid), '/usr/bin/sudo', '-H', '-u', '#' + uid, '/usr/bin/osascript', '-e', 'quit app "Visual Studio Code"']);
+  writeDiag('restartVSCodeIfRunning: quit command exitCode=' + quitResult.exitCode +
+    ' stdout=' + JSON.stringify(quitResult.stdout) + ' stderr=' + JSON.stringify(quitResult.stderr));
 
   var waited = 0;
   while (findRunningVSCodePids(uid).length > 0 && waited < 10) {
     _runCommand('/bin/sleep', ['1']);
     waited++;
   }
-  var remaining = findRunningVSCodePids(uid);
+  var pidsAfterWait = findRunningVSCodePids(uid);
+  writeDiag('restartVSCodeIfRunning: waited ' + waited + 's for quit to take effect; pids now = [' + pidsAfterWait.join(',') + ']');
+
+  var remaining = pidsAfterWait;
+  if (remaining.length > 0) {
+    writeDiag('restartVSCodeIfRunning: quit did not fully work - force-killing remaining pids [' + remaining.join(',') + ']');
+  }
   for (var i = 0; i < remaining.length; i++) {
     killPid(parseInt(remaining[i], 10), 9);
   }
+  var pidsAfterKill = findRunningVSCodePids(uid);
+  writeDiag('restartVSCodeIfRunning: pids after force-kill = [' + pidsAfterKill.join(',') + ']' +
+    (pidsAfterKill.length > 0 ? ' - STILL RUNNING, about to call open -a anyway' : ''));
 
-  _runCommand('/bin/launchctl', ['asuser', String(uid), '/usr/bin/sudo', '-u', '#' + uid, '/usr/bin/open', '-a', 'Visual Studio Code']);
+  var openResult = _runCommand('/bin/launchctl', ['asuser', String(uid), '/usr/bin/sudo', '-H', '-u', '#' + uid, '/usr/bin/open', '-a', 'Visual Studio Code']);
+  writeDiag('restartVSCodeIfRunning: open command exitCode=' + openResult.exitCode +
+    ' stdout=' + JSON.stringify(openResult.stdout) + ' stderr=' + JSON.stringify(openResult.stderr));
   return true;
 }
 
@@ -530,6 +630,15 @@ function run(argv) {
   var dryRun    = true; // safe default for bare local invocation
   var envelope;
 
+  // Deliberately placed before any real work at all - see restartVSCodeIfRunning's
+  // own comment on why this tracing is kept permanently rather than
+  // trimmed back. This specific checkpoint was what proved the real
+  // RTR-only "Timed out waiting for script to exit" failure was inside
+  // _runCommand itself (a dead timeout, since fixed) rather than earlier
+  // in staging/invocation: this line consistently reached DIAG_FILE while
+  // the unconditional RESULT: line at the bottom of this function did not.
+  writeDiag('run(): started, argv.length=' + (argv ? argv.length : 'null'));
+
   try {
     var input = null;
     if (argv && argv.length > 0 && argv[0]) {
@@ -538,6 +647,7 @@ function run(argv) {
       input        = JSON.parse(decoded);
       dryRun = castBool(getProp(input, 'dry_run', false), false);
     }
+    writeDiag('run(): decoded input, dry_run=' + dryRun);
     var params = getProp(input, 'params', {});
 
     var extId = getProp(params, 'extension_id', null);
@@ -558,9 +668,13 @@ function run(argv) {
 
     var extensionPath = getProp(params, 'extension_path', null);
     var targetUser = resolveTargetUser(extensionPath, extId); // never aborts
+    writeDiag('run(): resolved target user=' + targetUser.user + ' uid=' + targetUser.uid +
+      ' resolution_note=' + targetUser.resolution_note);
     var osMajor = getOSMajorVersion();
+    writeDiag('run(): about to call code --list-extensions (first call)');
 
     var listResult = listInstalledExtensions(targetUser.uid, targetUser.user);
+    writeDiag('run(): code --list-extensions (first call) returned exitCode=' + listResult.exitCode);
     if (listResult.exitCode !== 0) {
       throw {
         code: 'LIST_EXTENSIONS_FAILED',
@@ -569,6 +683,7 @@ function run(argv) {
     }
     var installedBefore = parseInstalledExtensionsList(listResult.stdout);
     var decision = decideVersionAction(installedBefore, extId, targetVersion);
+    writeDiag('run(): decision.action=' + decision.action + ' installedVersion=' + decision.installedVersion);
 
     var action = null;
     var installedVersionAfter = decision.installedVersion || null;
@@ -578,16 +693,22 @@ function run(argv) {
     } else if (decision.action === 'already_correct_version') {
       // Idempotent no-op.
     } else if (decision.action === 'set_version') {
+      writeDiag('run(): calling setExactVersion(' + extId + '@' + targetVersion + ')');
       action = setExactVersion(targetUser.uid, targetUser.user, extId, targetVersion, dryRun);
+      writeDiag('run(): setExactVersion returned ok=' + (action && action.ok));
     } else if (decision.action === 'upgrade_to_latest') {
+      writeDiag('run(): calling upgradeToLatest(' + extId + ')');
       action = upgradeToLatest(targetUser.uid, targetUser.user, extId, dryRun);
+      writeDiag('run(): upgradeToLatest returned ok=' + (action && action.ok));
     }
 
     if (action && action.attempted && action.ok) {
       // Re-list to find out what version we actually ended up at, and
       // whether anything really changed (relevant for upgrade_to_latest,
       // where we couldn't know the target version in advance).
+      writeDiag('run(): action ok - about to call code --list-extensions (re-list)');
       var listAfter = listInstalledExtensions(targetUser.uid, targetUser.user);
+      writeDiag('run(): code --list-extensions (re-list) returned exitCode=' + listAfter.exitCode);
       if (listAfter.exitCode === 0) {
         var installedAfter = parseInstalledExtensionsList(listAfter.stdout);
         installedVersionAfter = installedAfter[extId.toLowerCase()] || null;
@@ -595,15 +716,19 @@ function run(argv) {
     }
 
     var outcome = computeRunOutcome(decision, action, installedVersionAfter, dryRun);
+    writeDiag('run(): outcome status=' + outcome.status + ' changed=' + outcome.changed);
 
     var vscodeRestarted = false;
     if (outcome.status === 'success' && outcome.changed && !dryRun) {
+      writeDiag('run(): outcome is a real change - about to call restartVSCodeIfRunning');
       try {
         vscodeRestarted = restartVSCodeIfRunning(targetUser.uid);
+        writeDiag('run(): restartVSCodeIfRunning returned ' + vscodeRestarted);
       } catch (e) {
         writeDiag('WARN: failed to restart VS Code after version change: ' + e);
       }
     }
+    writeDiag('run(): about to build envelope and return');
 
     envelope = {
       os_family:                OS_FAMILY,

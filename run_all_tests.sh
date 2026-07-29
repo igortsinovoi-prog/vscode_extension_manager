@@ -20,8 +20,26 @@
 # root-fallback identity) when run as root - run this whole script under
 # sudo for that; everything else behaves the same either way.
 #
+# --rtr adds real-world checks over an actual CrowdStrike Falcon RTR
+# session, on top of the direct-invocation ones above - a genuinely
+# different code path (real put-file upload, a real session against a
+# real sensor-enrolled device), not a re-run of the same thing: this is
+# what actually surfaced two real macOS bugs neither direct invocation
+# nor the mocked suites ever could (see dist/README.md's "Bugs found").
+# Opt-in and additive, not a replacement - the direct-invocation stages
+# still run every time, --rtr or not.
+#   --platform mac-rtr: implemented, needs --device-aid and
+#     FALCON_CLIENT_ID/FALCON_CLIENT_SECRET in the environment (never as a
+#     flag - see real_world_check's own rtr_token() for why: argv is
+#     visible in shell history and to any other process via `ps`).
+#   --platform windows-rtr: NOT YET IMPLEMENTED (to be built and tested
+#     next) - --rtr prints a note and skips it rather than pretending to
+#     run something that doesn't exist yet.
+#
 # Usage:
 #   ./run_all_tests.sh --host <windows-ip> --user <windows-user> (--key <path> | --password <pw>)
+#   ./run_all_tests.sh --host <ip> --user <user> --key <path> \
+#     --rtr --device-aid <mac-device-aid>   # + real-RTR stages (FALCON_CLIENT_ID/SECRET in env)
 #
 # Each stage's full output (stdout+stderr) is both shown live and saved to
 # its own log file under test_logs/<timestamp>/, so a failure can be
@@ -30,6 +48,18 @@
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Local-only device AIDs / Falcon API credentials for --rtr - see
+# .env.local's own header and .gitignore. set -a so FALCON_CLIENT_ID/
+# FALCON_CLIENT_SECRET are actually exported for the real_world_check
+# child process below to see, not just set in this shell.
+if [[ -f "$ROOT_DIR/.env.local" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$ROOT_DIR/.env.local"
+  set +a
+fi
+
 LOG_DIR="$ROOT_DIR/test_logs/$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$LOG_DIR"
 ln -sfn "$LOG_DIR" "$ROOT_DIR/test_logs/latest"
@@ -39,6 +69,8 @@ REMOTE_HOST=""
 REMOTE_USER=""
 REMOTE_KEY="$HOME/.ssh/utm_windows_vm"
 REMOTE_PASSWORD=""
+RUN_RTR=false
+DEVICE_AID="${MAC_DEVICE_AID:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -46,8 +78,19 @@ while [[ $# -gt 0 ]]; do
     --user) REMOTE_USER="$2"; shift 2 ;;
     --key) REMOTE_KEY="$2"; shift 2 ;;
     --password) REMOTE_PASSWORD="$2"; shift 2 ;;
+    --rtr) RUN_RTR=true; shift ;;
+    --device-aid) DEVICE_AID="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: $0 --host <windows-ip> --user <windows-user> (--key <path> | --password <pw>)"
+      cat <<EOF
+Usage: $0 --host <windows-ip> --user <windows-user> (--key <path> | --password <pw>)
+       $0 ... --rtr --device-aid <mac-device-aid>
+
+  --rtr           Also run real-world checks over an actual CrowdStrike
+                   Falcon RTR session (mac-rtr; windows-rtr not yet
+                   implemented). Needs FALCON_CLIENT_ID/FALCON_CLIENT_SECRET
+                   in the environment - never pass these as flags.
+  --device-aid    Target device AID for the mac-rtr stage. Required with --rtr.
+EOF
       exit 0
       ;;
     *)
@@ -60,6 +103,17 @@ done
 if [[ -z "$REMOTE_HOST" || -z "$REMOTE_USER" ]]; then
   echo "Error: --host and --user are required (the Windows VM used for the windows-remote stages)" >&2
   exit 1
+fi
+
+if [[ "$RUN_RTR" == true ]]; then
+  if [[ -z "$DEVICE_AID" ]]; then
+    echo "Error: --rtr requires --device-aid (or MAC_DEVICE_AID in .env.local) - the mac-rtr stage's target device" >&2
+    exit 1
+  fi
+  if [[ -z "${FALCON_CLIENT_ID:-}" || -z "${FALCON_CLIENT_SECRET:-}" ]]; then
+    echo "Error: --rtr requires FALCON_CLIENT_ID and FALCON_CLIENT_SECRET (in the environment, or in .env.local)" >&2
+    exit 1
+  fi
 fi
 
 if [[ -n "$REMOTE_PASSWORD" ]]; then
@@ -109,6 +163,17 @@ run_stage "mac real-world check" "mac_real_world" \
 run_stage "windows real-world check (windows-remote)" "windows_real_world" \
   "$ROOT_DIR/real_world_check_set_vscode_extension_version.sh" --platform windows-remote \
     --host "$REMOTE_HOST" --user "$REMOTE_USER" "${WIN_AUTH_ARGS[@]}"
+
+if [[ "$RUN_RTR" == true ]]; then
+  run_stage "mac real-world check (mac-rtr)" "mac_rtr_real_world" \
+    "$ROOT_DIR/real_world_check_set_vscode_extension_version.sh" --platform mac-rtr \
+      --device-aid "$DEVICE_AID"
+
+  echo
+  echo "############################################################"
+  echo "### windows-rtr real-world check: SKIPPED (not yet implemented)"
+  echo "############################################################"
+fi
 
 # The mocked suites above test lib/ directly (concatenation doesn't change
 # behavior, so that's real coverage) - but js_scripts/dist/ and
