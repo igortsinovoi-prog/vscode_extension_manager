@@ -393,8 +393,12 @@ function Enable-VSCodeSignatureVerificationBypass {
   $settings = [ordered]@{}
   if ($originalRaw -and $originalRaw.Trim()) {
     try {
-      $parsed = $originalRaw | ConvertFrom-Json -AsHashtable
-      foreach ($key in $parsed.Keys) { $settings[$key] = $parsed[$key] }
+      # -AsHashtable is PowerShell 6.0+ only and does not exist in Windows
+      # PowerShell 5.1, which is what RTR's runscript actually invokes -
+      # ConvertFrom-Json without it returns a PSCustomObject on both 5.1 and
+      # 7+, so walk .PSObject.Properties instead.
+      $parsed = $originalRaw | ConvertFrom-Json
+      foreach ($property in $parsed.PSObject.Properties) { $settings[$property.Name] = $property.Value }
     } catch {
       Write-VSCodeDiag "WARN: could not parse existing settings.json at ${settingsPath}: $_ - leaving it untouched, signature bypass not applied for this call"
       return [PSCustomObject]@{ Applied = $false }
