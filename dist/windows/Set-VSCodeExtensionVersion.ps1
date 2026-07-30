@@ -968,16 +968,27 @@ function Get-VSCodeProcessOwners {
   param([string]$ProcessName)
   $result = @()
   try {
-    $procs = Get-CimInstance -ClassName Win32_Process -Filter "Name = '$ProcessName'"
+    $procs = Get-CimInstance -ClassName Win32_Process -Filter "Name = '$ProcessName'" -ErrorAction Stop
   } catch {
     return $result
   }
   foreach ($p in $procs) {
     try {
-      $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwner
+      # -ErrorAction Stop matters here, not just style - GetOwner on a
+      # process that has already exited (a real race: this list was just
+      # captured, but the target could be mid-exit right now, especially
+      # right after Restart-VSCodeIfRunning's own graceful-close attempt)
+      # fails as a NON-terminating error by default, which this catch
+      # would never actually intercept (catch only sees terminating
+      # errors) - confirmed real via a live RTR run: "Invoke-CimMethod :
+      # Not found" leaking into the envelope's own stderr, violating the
+      # RTR contract's "stderr always silent" guarantee, while this catch
+      # block's own "skip rather than guess" comment was silently dead
+      # code the whole time for exactly this failure mode.
+      $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop
       $result += [PSCustomObject]@{ ProcessId = $p.ProcessId; User = $owner.User }
     } catch {
-      # can't determine this process's owner - skip rather than guess
+      Write-VSCodeDiag "WARN: could not determine owner for pid $($p.ProcessId) (likely already exited): $_"
     }
   }
   return $result
