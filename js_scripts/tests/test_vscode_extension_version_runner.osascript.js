@@ -516,6 +516,23 @@ test('setExactVersion: CLI failure is reported as not ok, with stderr captured',
   assertEqual(result.stderr, 'network error');
 });
 
+test('setExactVersion: short stdout/stderr pass through unchanged in the envelope', function () {
+  mockConfig.installResult = { exitCode: 0, stdout: 'short output', stderr: 'short stderr' };
+  var result = setExactVersion(501, 'jdoe', 'ms-python.python', '2024.1.0', false);
+  assertEqual(result.stdout, 'short output');
+  assertEqual(result.stderr, 'short stderr');
+});
+
+test('setExactVersion: stdout/stderr over 2000 chars are truncated for the envelope (full text still goes to diag - see truncateForEnvelope)', function () {
+  var longOutput = 'x'.repeat(2500);
+  mockConfig.installResult = { exitCode: 0, stdout: longOutput, stderr: longOutput };
+  var result = setExactVersion(501, 'jdoe', 'ms-python.python', '2024.1.0', false);
+  assertTrue(result.stdout.length < longOutput.length);
+  assertTrue(result.stdout.indexOf('x'.repeat(2000)) === 0);
+  assertTrue(result.stdout.indexOf('truncated, 2500 chars total') !== -1);
+  assertTrue(result.stderr.indexOf('truncated, 2500 chars total') !== -1);
+});
+
 // ---------------------------------------------------------------------------
 // run(argv) end-to-end (mocked _runCommand; fileExists temporarily overridden
 // where needed so this doesn't depend on VS Code actually being installed)

@@ -77,6 +77,12 @@ $Script:DefaultCmdTimeoutSec = 20
 # Installing/upgrading an extension downloads a VSIX over the network - give
 # it much longer than a quick local command before we give up.
 $Script:InstallCmdTimeoutSec = 120
+# The envelope is meant to stay compact (a pass/fail signal, not a log
+# dump) - real code.cmd output can run to several KB (deprecation
+# warnings, full marketplace install logs, ...). The FULL text always
+# still goes to the diag file first (see ConvertTo-VSCodeTruncatedText's
+# own callers); this only bounds what actually ends up in the JSON.
+$Script:MaxCliOutputEnvelopeLen = 2000
 
 # SYSTEM's own conventional profile-relative extensions path - the Windows
 # analogue of the macOS side's HOME=/var/root root-fallback isolation.
@@ -734,6 +740,19 @@ function Get-VSCodeInstalledExtensionsRaw {
     -Arguments @('--list-extensions', '--show-versions') -TimeoutSec $Script:DefaultCmdTimeoutSec
 }
 
+# Trims text for the envelope after logging the FULL, untruncated version
+# to diag first - the envelope is meant to stay compact (a pass/fail
+# signal, not a log dump), but nothing actually gets lost: the complete
+# output is always still recoverable from the diag file.
+function ConvertTo-VSCodeTruncatedText {
+  param([string]$Text, [string]$Label)
+  $Text = if ($Text) { $Text } else { '' }
+  Write-VSCodeDiag "$Label (full, $($Text.Length) chars): $Text"
+  if ($Text.Length -le $Script:MaxCliOutputEnvelopeLen) { return $Text }
+  return $Text.Substring(0, $Script:MaxCliOutputEnvelopeLen) +
+    "... [truncated, $($Text.Length) chars total - see diag for the full text]"
+}
+
 function Invoke-VSCodeUpgradeToLatest {
   param([string]$CodePath, [string]$ExtensionsDir, [string]$ExtId, [bool]$DryRun)
   if ($DryRun) { return [PSCustomObject]@{ Attempted = $false; DryRun = $true; Ok = $false; Stderr = '' } }
@@ -743,12 +762,14 @@ function Invoke-VSCodeUpgradeToLatest {
   # installs latest instead.
   $r = Invoke-VSCodeCli -CodePath $CodePath -ExtensionsDir $ExtensionsDir `
     -Arguments @('--install-extension', $ExtId, '--force') -TimeoutSec $Script:InstallCmdTimeoutSec
+  $stdout = if ($r.Stdout) { $r.Stdout.Trim() } else { '' }
+  $stderr = if ($r.Stderr) { $r.Stderr.Trim() } else { '' }
   return [PSCustomObject]@{
     Attempted = $true
     ExitCode  = $r.ExitCode
     Ok        = ($r.ExitCode -eq 0)
-    Stdout    = if ($r.Stdout) { $r.Stdout.Trim() } else { '' }
-    Stderr    = if ($r.Stderr) { $r.Stderr.Trim() } else { '' }
+    Stdout    = ConvertTo-VSCodeTruncatedText $stdout 'Invoke-VSCodeUpgradeToLatest stdout'
+    Stderr    = ConvertTo-VSCodeTruncatedText $stderr 'Invoke-VSCodeUpgradeToLatest stderr'
   }
 }
 
@@ -757,12 +778,14 @@ function Invoke-VSCodeSetExactVersion {
   if ($DryRun) { return [PSCustomObject]@{ Attempted = $false; DryRun = $true; Ok = $false; Stderr = '' } }
   $r = Invoke-VSCodeCli -CodePath $CodePath -ExtensionsDir $ExtensionsDir `
     -Arguments @('--install-extension', "$ExtId@$Version", '--force') -TimeoutSec $Script:InstallCmdTimeoutSec
+  $stdout = if ($r.Stdout) { $r.Stdout.Trim() } else { '' }
+  $stderr = if ($r.Stderr) { $r.Stderr.Trim() } else { '' }
   return [PSCustomObject]@{
     Attempted = $true
     ExitCode  = $r.ExitCode
     Ok        = ($r.ExitCode -eq 0)
-    Stdout    = if ($r.Stdout) { $r.Stdout.Trim() } else { '' }
-    Stderr    = if ($r.Stderr) { $r.Stderr.Trim() } else { '' }
+    Stdout    = ConvertTo-VSCodeTruncatedText $stdout 'Invoke-VSCodeSetExactVersion stdout'
+    Stderr    = ConvertTo-VSCodeTruncatedText $stderr 'Invoke-VSCodeSetExactVersion stderr'
   }
 }
 

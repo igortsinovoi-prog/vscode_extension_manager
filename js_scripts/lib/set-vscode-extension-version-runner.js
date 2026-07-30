@@ -68,6 +68,14 @@ var POLL_INTERVAL_SEC       = 0.1;
 // Installing/upgrading an extension downloads a VSIX over the network -
 // give it much longer than a quick local command before we give up.
 var INSTALL_CMD_TIMEOUT_SEC = 120;
+// The envelope is meant to stay compact (RTR/whatever consumes this
+// output shouldn't have to deal with an arbitrarily large payload for
+// what's fundamentally a pass/fail signal) - real `code` CLI output can
+// run to several KB (deprecation warnings, full marketplace install
+// logs, ...). The FULL text always still goes to the diag file first
+// (see truncateForEnvelope's own callers); this only bounds what
+// actually ends up in the returned JSON.
+var MAX_CLI_OUTPUT_ENVELOPE_LEN = 2000;
 
 var VSCODE = {
   codePath: '/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code',
@@ -606,6 +614,18 @@ function listInstalledExtensions(uid, user) {
   return runCode(uid, user, ['--list-extensions', '--show-versions']);
 }
 
+// Trims text for the envelope after logging the FULL, untruncated
+// version to diag first - the envelope is meant to stay compact (a
+// pass/fail signal, not a log dump), but nothing actually gets lost:
+// the complete output is always still recoverable from the diag file.
+function truncateForEnvelope(text, label) {
+  text = text || '';
+  writeDiag(label + ' (full, ' + text.length + ' chars): ' + text);
+  if (text.length <= MAX_CLI_OUTPUT_ENVELOPE_LEN) return text;
+  return text.slice(0, MAX_CLI_OUTPUT_ENVELOPE_LEN) +
+    '... [truncated, ' + text.length + ' chars total - see diag for the full text]';
+}
+
 function upgradeToLatest(uid, user, extId, dryRun) {
   if (dryRun) return { attempted: false, dry_run: true };
   // `code --upgrade-extension <id>` is NOT a real flag on this CLI (verified
@@ -618,8 +638,8 @@ function upgradeToLatest(uid, user, extId, dryRun) {
     attempted: true,
     exit_code: r.exitCode,
     ok: r.exitCode === 0,
-    stdout: (r.stdout || '').trim(),
-    stderr: (r.stderr || '').trim(),
+    stdout: truncateForEnvelope((r.stdout || '').trim(), 'upgradeToLatest stdout'),
+    stderr: truncateForEnvelope((r.stderr || '').trim(), 'upgradeToLatest stderr'),
   };
 }
 
@@ -632,8 +652,8 @@ function setExactVersion(uid, user, extId, version, dryRun) {
     attempted: true,
     exit_code: r.exitCode,
     ok: r.exitCode === 0,
-    stdout: (r.stdout || '').trim(),
-    stderr: (r.stderr || '').trim(),
+    stdout: truncateForEnvelope((r.stdout || '').trim(), 'setExactVersion stdout'),
+    stderr: truncateForEnvelope((r.stderr || '').trim(), 'setExactVersion stderr'),
   };
 }
 

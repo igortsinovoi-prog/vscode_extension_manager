@@ -289,6 +289,23 @@ Context 'Invoke-VSCodeUpgradeToLatest / Invoke-VSCodeSetExactVersion dry-run gat
     $result.Ok | Should -BeFalse
     $result.Stderr | Should -Be 'network error'
   }
+
+  It 'setExactVersion: short stdout/stderr pass through unchanged in the envelope' {
+    $script:MockConfig.InstallResult = [PSCustomObject]@{ ExitCode = 0; Stdout = 'short output'; Stderr = 'short stderr' }
+    $result = Invoke-VSCodeSetExactVersion 'C:\code.cmd' 'C:\Users\jdoe\.vscode\extensions' 'ms-python.python' '2024.1.0' $false
+    $result.Stdout | Should -Be 'short output'
+    $result.Stderr | Should -Be 'short stderr'
+  }
+
+  It 'setExactVersion: stdout/stderr over 2000 chars are truncated for the envelope (full text still goes to diag - see ConvertTo-VSCodeTruncatedText)' {
+    $longOutput = 'x' * 2500
+    $script:MockConfig.InstallResult = [PSCustomObject]@{ ExitCode = 0; Stdout = $longOutput; Stderr = $longOutput }
+    $result = Invoke-VSCodeSetExactVersion 'C:\code.cmd' 'C:\Users\jdoe\.vscode\extensions' 'ms-python.python' '2024.1.0' $false
+    $result.Stdout.Length | Should -BeLessThan $longOutput.Length
+    $result.Stdout.StartsWith('x' * 2000) | Should -BeTrue
+    $result.Stdout | Should -Match 'truncated, 2500 chars total'
+    $result.Stderr | Should -Match 'truncated, 2500 chars total'
+  }
 }
 
 Context 'Get-VSCodeRunningPidsForUser / Restart-VSCodeIfRunning' {
