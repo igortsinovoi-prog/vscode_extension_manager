@@ -6,14 +6,14 @@
 # ../real_world_check_set_vscode_extension_version.sh's --platform
 # dispatch and remote-command plumbing.
 #
-# For --target windows-remote, only lib/, tests/, and run_all_tests.ps1
+# For --target windows, only lib/, tests/, and run_all_tests.ps1
 # are copied (not the whole repo, no git required on the remote box) into
 # a scratch directory under the remote user's %TEMP%, deleted again once
 # the run finishes, success or failure.
 #
 # Usage:
 #   ps_scripts/run_all_tests.sh --target local
-#   ps_scripts/run_all_tests.sh --target windows-remote --host <ip> --user <user> (--key <path> | --password <pw>)
+#   ps_scripts/run_all_tests.sh --target windows --host <ip> --user <user> (--key <path> | --password <pw>)
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # ps_scripts/
@@ -23,6 +23,7 @@ REMOTE_HOST=""
 REMOTE_USER=""
 REMOTE_KEY="$HOME/.ssh/utm_windows_vm"
 REMOTE_PASSWORD=""
+REMOTE_PORT="22"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -31,8 +32,9 @@ while [[ $# -gt 0 ]]; do
     --user) REMOTE_USER="$2"; shift 2 ;;
     --key) REMOTE_KEY="$2"; shift 2 ;;
     --password) REMOTE_PASSWORD="$2"; shift 2 ;;
+    --port) REMOTE_PORT="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: $0 --target local|windows-remote [--host H --user U (--key K | --password P)]"
+      echo "Usage: $0 --target local|windows [--host H --user U (--key K | --password P) --port P]"
       exit 0
       ;;
     *)
@@ -50,12 +52,12 @@ if [[ "$TARGET" == "local" ]]; then
   exec pwsh -NoProfile -File "$DIR/run_all_tests.ps1"
 fi
 
-if [[ "$TARGET" != "windows-remote" ]]; then
-  echo "Error: --target must be 'local' or 'windows-remote'" >&2
+if [[ "$TARGET" != "windows" ]]; then
+  echo "Error: --target must be 'local' or 'windows'" >&2
   exit 1
 fi
 if [[ -z "$REMOTE_HOST" || -z "$REMOTE_USER" ]]; then
-  echo "Error: --target windows-remote requires --host and --user" >&2
+  echo "Error: --target windows requires --host and --user" >&2
   exit 1
 fi
 
@@ -66,7 +68,11 @@ if [[ -n "$REMOTE_PASSWORD" ]]; then
     echo "Error: --password requires sshpass (brew install sshpass)" >&2
     exit 1
   fi
-  SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no)
+  # -o Port=, not -p/-P - see real_world_check_set_vscode_extension_version.sh's
+  # own comment on this same pattern: ssh and scp use different flag
+  # letters for the same thing, but both accept -o for arbitrary
+  # ssh_config options.
+  SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no -o "Port=$REMOTE_PORT")
   # -e (password via the SSHPASS env var), not -p - see
   # real_world_check_set_vscode_extension_version.sh's own comment on this
   # same pattern: -p crashed outright (SIGSEGV in sshpass's own
@@ -80,7 +86,7 @@ if [[ -n "$REMOTE_PASSWORD" ]]; then
   SSH_PREFIX=(sshpass -eSSHPASS ssh)
   SCP_PREFIX=(sshpass -eSSHPASS scp)
 else
-  SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -i "$REMOTE_KEY")
+  SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -i "$REMOTE_KEY" -o "Port=$REMOTE_PORT")
   SSH_PREFIX=(ssh)
   SCP_PREFIX=(scp)
 fi

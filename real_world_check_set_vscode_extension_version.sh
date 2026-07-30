@@ -6,7 +6,7 @@
 # scenario list and assertions below are identical across platforms - only
 # how each individual command actually runs differs, selected via
 # --platform. This script itself always runs as bash on the Mac; for
-# --platform windows-remote it drives a real Windows box over SSH rather
+# --platform windows it drives a real Windows box over SSH rather
 # than requiring bash on Windows.
 #
 # Not part of either platform's mocked test suite (js_scripts/run_all_tests.sh
@@ -17,7 +17,7 @@
 #
 # Usage:
 #   ./real_world_check_set_vscode_extension_version.sh --platform mac
-#   ./real_world_check_set_vscode_extension_version.sh --platform windows-remote --host <ip> --user <user> [--key <path>]
+#   ./real_world_check_set_vscode_extension_version.sh --platform windows --host <ip> --user <user> [--key <path>]
 #   ./real_world_check_set_vscode_extension_version.sh --platform mac --scenario 15   # only scenario(s) 15 (repeatable; "5" runs both 5a and 5b)
 #
 # Scenario 1: extension removed -> must no-op (never installs it fresh).
@@ -141,6 +141,7 @@ REMOTE_HOST=""
 REMOTE_USER=""
 REMOTE_KEY="$HOME/.ssh/utm_windows_vm"
 REMOTE_PASSWORD=""
+REMOTE_PORT="22"
 SSH_OPTS=()
 SSH_PREFIX=()
 SCP_PREFIX=()
@@ -164,10 +165,11 @@ while [[ $# -gt 0 ]]; do
     --user) REMOTE_USER="$2"; shift 2 ;;
     --key) REMOTE_KEY="$2"; shift 2 ;;
     --password) REMOTE_PASSWORD="$2"; shift 2 ;;
+    --port) REMOTE_PORT="$2"; shift 2 ;;
     --scenario) ONLY_SCENARIOS="$ONLY_SCENARIOS $2"; shift 2 ;;
     --device-aid) DEVICE_AID="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: $0 --platform mac|windows-remote|mac-rtr [--host H --user U (--key K | --password P)] [--device-aid AID] [--scenario N ...]"
+      echo "Usage: $0 --platform mac|windows|mac-rtr|windows-rtr [--host H --user U (--key K | --password P) --port P] [--device-aid AID] [--scenario N ...]"
       exit 0
       ;;
     *)
@@ -205,7 +207,12 @@ if [[ -n "$REMOTE_PASSWORD" ]]; then
   # real risk of getting silently dropped for inactivity somewhere along
   # that path (NAT/firewall/VM hypervisor network layer) well before the
   # remote command itself would ever time out on its own.
-  SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10)
+  # -o Port=, not -p/-P: ssh and scp use different flag letters for the
+  # same thing (-p vs -P, and scp's -p means something else entirely -
+  # "preserve modification times"), but both accept -o for arbitrary
+  # ssh_config options, so one shared SSH_OPTS entry works for both
+  # instead of needing a separate port flag at every scp call site.
+  SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -o "Port=$REMOTE_PORT")
   # -e (password via the SSHPASS env var), not -p (password as a literal
   # argument) - sshpass's own -p mode tries to scrub the password out of
   # this process's argv afterward (hide_password(), so `ps` can't see it),
@@ -223,7 +230,7 @@ if [[ -n "$REMOTE_PASSWORD" ]]; then
   SSH_PREFIX=(sshpass -eSSHPASS ssh)
   SCP_PREFIX=(sshpass -eSSHPASS scp)
 else
-  SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i "$REMOTE_KEY")
+  SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -i "$REMOTE_KEY" -o "Port=$REMOTE_PORT")
   SSH_PREFIX=(ssh)
   SCP_PREFIX=(scp)
 fi
@@ -445,6 +452,66 @@ rtr_cleanup_deployed_script() {
   rtr_clear_stale_put_file 2>/dev/null || true
 }
 
+# The windows-rtr override for run_dist_script (see the windows
+# case branch further down, which reassigns run_dist_script to call this
+# when PLATFORM=windows-rtr). Same lazy-first-call shape as
+# rtr_run_dist_script above (mac-rtr) - upload, session, staging happen
+# once, gated on RTR_SESSION_ID - but every -Raw= command uses PowerShell
+# syntax instead of bash, and the invoked interpreter is `powershell`
+# instead of `osascript -l JavaScript`, per
+# ~/Documents/CodeStation/rtr-put-file-guide.md (already confirmed
+# working for real against a Windows target). rtr_token/rtr_api/rtr_send/
+# rtr_field/rtr_clear_stale_put_file/rtr_upload_put_file/rtr_open_session
+# are all OS-agnostic already and reused unchanged; rtr_cleanup_deployed_script
+# above is reused unchanged too (it only touches RTR_SESSION_ID/RTR_PUT_NAME).
+rtr_run_dist_script_windows() {
+  local payload="$1"
+  if [[ -z "$RTR_SESSION_ID" ]]; then
+    echo "==> [windows-rtr] Minting Falcon API token" >&2
+    rtr_token
+    echo "==> [windows-rtr] Clearing any stale put-file named $RTR_PUT_NAME" >&2
+    rtr_clear_stale_put_file
+    echo "==> [windows-rtr] Uploading $DIST_SCRIPT as a put-file" >&2
+    rtr_upload_put_file
+    echo "==> [windows-rtr] Opening an RTR session against device $DEVICE_AID" >&2
+    rtr_open_session
+    echo "==> [windows-rtr] Staging the script onto the target disk" >&2
+    rtr_send "runscript" 'runscript -Raw=```New-Item -ItemType Directory -Force -Path "'"$RTR_REMOTE_DIR"'" | Out-Null```' >/dev/null
+    rtr_send "cd" "cd $RTR_REMOTE_DIR" >/dev/null
+    # Same "put refuses to overwrite" real-world finding as the mac-rtr
+    # side (see rtr_run_dist_script's own comment) - force a clean slate
+    # first, every time.
+    rtr_send "runscript" 'runscript -Raw=```Remove-Item -Force -ErrorAction SilentlyContinue -Path "'"$RTR_REMOTE_PATH"'"```' >/dev/null
+    local put_resp put_err
+    put_resp="$(rtr_send "put" "put \"$RTR_PUT_NAME\"")"
+    put_err="$(rtr_field "$put_resp" stderr)"
+    [[ -n "$put_err" ]] && echo "  WARNING: [windows-rtr] put reported stderr: $put_err" >&2
+    # Check it actually landed before ever invoking it - same reason as
+    # mac-rtr's own check: a silently failed put would otherwise only
+    # surface later as a confusing file-not-found.
+    local check_resp check_out
+    check_resp="$(rtr_send "runscript" 'runscript -Raw=```if (Test-Path "'"$RTR_REMOTE_PATH"'") { "FOUND" } else { "MISSING" }```')"
+    check_out="$(rtr_field "$check_resp" stdout | tr -d '[:space:]')"
+    if [[ "$check_out" != "FOUND" ]]; then
+      echo "Error: [windows-rtr] put didn't stage the file at $RTR_REMOTE_PATH - stop before invoking" >&2
+      exit 1
+    fi
+  fi
+
+  local invoke_cmd resp out err
+  invoke_cmd='runscript -Raw=```powershell -NoProfile -ExecutionPolicy Bypass -File "'"$RTR_REMOTE_PATH"'" "'"$payload"'"```'
+  resp="$(rtr_send "runscript" "$invoke_cmd")"
+  out="$(rtr_field "$resp" stdout)"
+  err="$(rtr_field "$resp" stderr)"
+  [[ -n "$err" ]] && echo "  WARNING: [windows-rtr] runscript reported stderr: $err" >&2
+  # Unlike mac-rtr's own return (confirmed clean via direct testing),
+  # this is unverified until a real live run: every other Windows
+  # PowerShell output path in this file needs \r stripped before the
+  # caller's JSON parsing sees it, and RTR's own transport has no reason
+  # to be different.
+  printf '%s' "$out" | tr -d '\r'
+}
+
 # ===== Platform dispatch =====
 #
 # Each platform branch below defines the same set of primitives the
@@ -543,7 +610,7 @@ case "$PLATFORM" in
     build_dist() { "$ROOT_DIR/js_scripts/build.sh"; }
     # No-op on mac: build_dist writes to the repo's own js_scripts/dist/,
     # a normal build artifact, not a temp file needing cleanup (unlike the
-    # windows-remote branch's copy under the remote %TEMP%).
+    # windows branch's copy under the remote %TEMP%).
     cleanup_deployed_script() { :; }
     # mac-rtr: identical to mac in every other way (same machine, same
     # code_cli/GUI-session/assertion/cleanup functions above and below) -
@@ -658,6 +725,39 @@ with open(path, "w") as f:
     }
     _vscode_main_process_pids() {
       ps aux | grep -F "Visual Studio Code.app/Contents/MacOS/Code" | grep -v grep | awk '{print $2}'
+    }
+    # Scenario 18's own primitives: backs up the REAL code binary and
+    # replaces it with a stub that hangs forever, so our own deployed
+    # script's real, production command-timeout mechanism has to fire for
+    # a genuinely hung `code` invocation, through the actual RTR contract
+    # (run_script/run_dist_script) - not by loading the runner source and
+    # calling an internal function directly. Refuses to stub while a real
+    # VS Code process is running, as a safety precondition - swapping out
+    # its CLI helper out from under an active session is not something to
+    # risk even though the GUI app itself doesn't depend on this exact
+    # file for its own normal operation. CODE_BIN_STUBBED itself is a
+    # shared, cross-platform global declared once further down (see its
+    # own comment there).
+    CODE_BIN_BACKUP_PATH="/tmp/glow_rwc_code_backup_$$"
+    stub_code_binary() {
+      if _vscode_main_process_running; then
+        echo "Error: [scenario 18] refusing to stub the code binary while a real VS Code process is running" >&2
+        return 1
+      fi
+      cp -p "$CODE_BIN" "$CODE_BIN_BACKUP_PATH"
+      cat > "$CODE_BIN" <<'STUB'
+#!/bin/bash
+sleep 60
+STUB
+      chmod +x "$CODE_BIN"
+      CODE_BIN_STUBBED=true
+    }
+    restore_code_binary() {
+      if [[ "$CODE_BIN_STUBBED" == true ]]; then
+        cp -p "$CODE_BIN_BACKUP_PATH" "$CODE_BIN"
+        rm -f "$CODE_BIN_BACKUP_PATH"
+        CODE_BIN_STUBBED=false
+      fi
     }
     # Scenario 17's own primitive: the set of currently-running VS Code
     # main-process pids, platform-agnostic name so that scenario's shared
@@ -807,15 +907,15 @@ with open(path, "w") as f:
     # path to the marketplace (confirmed transient: an install timed out,
     # then an unrelated HTTPS request to the same host succeeded moments
     # later). Mac hasn't shown this problem, so there's nothing to prime
-    # here - see the windows-remote branch's own version of this function
+    # here - see the windows branch's own version of this function
     # for the real implementation.
     prime_vsix_cache() { :; }
-    # No-op on mac - see the windows-remote branch's own version.
+    # No-op on mac - see the windows branch's own version.
     restore_vsix_cache_entry() { :; }
     ;;
-  windows-remote)
+  windows | windows-rtr)
     if [[ -z "$REMOTE_HOST" || -z "$REMOTE_USER" ]]; then
-      echo "Error: --platform windows-remote requires --host and --user" >&2
+      echo "Error: --platform $PLATFORM requires --host and --user" >&2
       exit 1
     fi
     REMOTE="$REMOTE_USER@$REMOTE_HOST"
@@ -921,6 +1021,49 @@ exit \$LASTEXITCODE
 PS
     }
 
+    # Scenario 18's own primitives (windows/windows-rtr) - same intent as
+    # the mac branch's own stub_code_binary: back up the REAL code.cmd and
+    # replace it with a stub that hangs forever, so the real production
+    # command-timeout mechanism has to fire for a genuinely hung `code`
+    # invocation through the actual RTR contract. Resolves the real path
+    # via Get-Command (the same PATH resolution code_cli itself already
+    # relies on above, proven working by every other scenario in this
+    # file), not a duplicated copy of Find-VSCodeCli's own candidate-path
+    # search. Plain SSH + real powershell.exe throughout, deliberately not
+    # remote_ps (which runs everything via pwsh 7) or code_cli - this is
+    # about the real code.cmd file on disk, not the deployed script.
+    CODE_CMD_REAL_PATH=""
+    CODE_CMD_BACKUP_PATH=""
+    stub_code_binary() {
+      CODE_CMD_REAL_PATH="$("${SSH_PREFIX[@]}" "${SSH_OPTS[@]}" "$REMOTE" \
+        "powershell -NoProfile -Command \"(Get-Command code.cmd -ErrorAction SilentlyContinue).Source\"" | tr -d '\r')"
+      if [[ -z "$CODE_CMD_REAL_PATH" ]]; then
+        echo "Error: [scenario 18] could not resolve the real code.cmd path via Get-Command" >&2
+        return 1
+      fi
+      local running
+      running="$("${SSH_PREFIX[@]}" "${SSH_OPTS[@]}" "$REMOTE" \
+        "powershell -NoProfile -Command \"[bool](Get-Process -Name Code -ErrorAction SilentlyContinue)\"" | tr -d '\r')"
+      if [[ "$running" != "False" ]]; then
+        echo "Error: [scenario 18] refusing to stub code.cmd - a real VS Code process appears to be running (or its state could not be confirmed)" >&2
+        return 1
+      fi
+      CODE_CMD_BACKUP_PATH="${CODE_CMD_REAL_PATH}.rwc18bak"
+      "${SSH_PREFIX[@]}" "${SSH_OPTS[@]}" "$REMOTE" \
+        "powershell -NoProfile -Command \"Copy-Item -LiteralPath '$CODE_CMD_REAL_PATH' -Destination '$CODE_CMD_BACKUP_PATH' -Force\"" || return 1
+      "${SCP_PREFIX[@]}" -q "${SSH_OPTS[@]}" \
+        "$ROOT_DIR/ps_scripts/tests/stub_code_that_hangs.cmd" "$REMOTE:$CODE_CMD_REAL_PATH" || return 1
+      CODE_BIN_STUBBED=true
+    }
+    restore_code_binary() {
+      if [[ "$CODE_BIN_STUBBED" == true ]]; then
+        "${SSH_PREFIX[@]}" "${SSH_OPTS[@]}" "$REMOTE" \
+          "powershell -NoProfile -Command \"Move-Item -LiteralPath '$CODE_CMD_BACKUP_PATH' -Destination '$CODE_CMD_REAL_PATH' -Force\"" \
+          || echo "    WARNING: [scenario 18] failed to restore the real code.cmd from backup - manual recovery needed at $CODE_CMD_REAL_PATH" >&2
+        CODE_BIN_STUBBED=false
+      fi
+    }
+
     run_dist_script() {
       local payload="$1"
       remote_ps <<PS
@@ -951,6 +1094,38 @@ PS
 Remove-Item -Path "$REMOTE_DIST" -Force -ErrorAction SilentlyContinue
 PS
     }
+    # windows-rtr: identical to windows in every other way (same
+    # code_cli/symlink-scenario/settings-backup/GUI-session/assertion
+    # functions above and below, all still driven over the admin SSH
+    # channel - RTR is only the *deployment* channel under test, not how
+    # the harness sets up/asserts state) - only how the deployed script is
+    # actually invoked differs. build_dist is overridden too: no SSH copy
+    # to %TEMP% needed, since rtr_run_dist_script_windows itself uploads
+    # DIST_SCRIPT as a put-file from the freshly-built local file on its
+    # own first call, the same way mac-rtr's build_dist stays local-only.
+    if [[ "$PLATFORM" == "windows-rtr" ]]; then
+      if [[ -z "$DEVICE_AID" ]]; then
+        echo "Error: --platform windows-rtr requires --device-aid <AID>" >&2
+        exit 1
+      fi
+      RTR_PUT_NAME="Set-VSCodeExtensionVersion-rtr-check.ps1"
+      RTR_REMOTE_DIR='C:\Windows\Temp\glow_rwc_rtr'
+      RTR_REMOTE_PATH="$RTR_REMOTE_DIR\\$RTR_PUT_NAME"
+      # rtr_upload_put_file (shared with mac-rtr) reads $DIST_SCRIPT, not
+      # $LOCAL_DIST_FILE - the mac branch sets the former for its own use,
+      # windows only ever set the latter (for its own plain-SSH build_dist
+      # scp). Bridge the two here, real bug found on the first live run:
+      # "DIST_SCRIPT: unbound variable" under set -u.
+      DIST_SCRIPT="$LOCAL_DIST_FILE"
+      build_dist() { "$ROOT_DIR/ps_scripts/build.sh" >&2; }
+      run_dist_script() { rtr_run_dist_script_windows "$1"; }
+      cleanup_deployed_script() { rtr_cleanup_deployed_script; }
+      # A Windows RTR session runs as SYSTEM, not the admin SSH account -
+      # same IS_ROOT gating reason as the mac branch's own mac-rtr (see
+      # its comment above), exercising scenario 5b's SYSTEM-fallback
+      # identity path on Windows for real, for the first time.
+      IS_ROOT=true
+    fi
     # Prints the real settings.json's raw content, or "" if it doesn't
     # exist yet - captured by the caller and handed back to
     # restore_settings_backup so scenario 16 can leave this file exactly
@@ -1282,7 +1457,7 @@ PS
     }
     ;;
   *)
-    echo "Error: --platform must be 'mac', 'mac-rtr', or 'windows-remote'" >&2
+    echo "Error: --platform must be 'mac', 'mac-rtr', 'windows', or 'windows-rtr'" >&2
     exit 1
     ;;
 esac
@@ -1352,7 +1527,7 @@ set_installed_version() {
   # is what made scenario 15's control-extension setup look like a silent
   # stall before it was fixed there).
   # Retried, not a single attempt - the confirmed network flakiness on
-  # the windows-remote VM (ETIMEDOUT/ECONNRESET/DNS failures, all
+  # the windows VM (ETIMEDOUT/ECONNRESET/DNS failures, all
   # observed directly) applies here too, and this is the one remaining
   # install helper that had no retry loop at all (install_latest_or_die
   # and the "resolving latest" setup step both already do).
@@ -1456,6 +1631,12 @@ skip() {
 }
 
 GUI_SESSION_LAUNCHED=false
+# Scenario 18's own flag, shared across platforms (set true by whichever
+# platform's stub_code_binary succeeds) so restore_original_state's
+# safety net below can restore the real code binary/code.cmd regardless
+# of platform, and - critically - BEFORE any of its own code_cli calls,
+# which would themselves hang against a still-stubbed binary otherwise.
+CODE_BIN_STUBBED=false
 SETTINGS_BACKUP_CAPTURED=false
 SETTINGS_BACKUP_VALUE=""
 # Declared here (not just before its first real use below) because
@@ -1539,6 +1720,12 @@ restore_original_state() {
   if [[ "$SETTINGS_BACKUP_CAPTURED" == true ]]; then
     restore_settings_backup "$SETTINGS_BACKUP_VALUE" || echo "    WARNING: failed to restore settings.json (continuing)"
   fi
+  # Scenario 18's own safety net - MUST run before any of the code_cli
+  # calls below: those would themselves hang against a still-stubbed
+  # binary if scenario 18 died before its own explicit restore ran.
+  if [[ "$CODE_BIN_STUBBED" == true ]]; then
+    restore_code_binary || echo "    WARNING: failed to restore the real code binary/code.cmd (continuing)"
+  fi
 
   echo "==> Restoring original state of $EXT_ID"
   if [[ -n "$ORIGINAL_VERSION" ]]; then
@@ -1570,7 +1757,7 @@ restore_original_state() {
   # Last step, unconditionally (even after an early failure elsewhere in the
   # run) - see audit_ownership's own per-platform definition: mac's is a
   # real check() (counts toward PASS/FAIL, can fail the run) because it
-  # caught a genuine bug there; windows-remote's is informational-only,
+  # caught a genuine bug there; windows's is informational-only,
   # since SYSTEM/Administrators ownership is that platform's actual,
   # documented, by-design behavior, not a regression to assert against.
   echo "==> Auditing file ownership (everything touched must still belong to the real target user)"
@@ -2090,6 +2277,32 @@ else
     "$(vscode_gui_session_running && echo running || echo not_running)" "not_running"
 fi
 
+fi
+if scenario_enabled "18"; then
+echo
+echo "=== Scenario 18: a real, indefinitely-hung code invocation is detected, killed, and reported - not left running or hung forever ==="
+if stub_code_binary; then
+  echo "  ==> Real code binary/code.cmd backed up and replaced with a stub that hangs forever"
+  start_ts=$(date +%s)
+  result="$(run_script "" "false" "$USER_EXTENSION_PATH")"
+  end_ts=$(date +%s)
+  elapsed=$((end_ts - start_ts))
+  echo "  envelope: $result"
+  echo "  (call returned after ${elapsed}s)"
+  # Generous bound - the real timeout+kill mechanism (~20-22s on both
+  # platforms) plus process/SSH overhead should never come close to this;
+  # only a real regression (the hung process never actually killed)
+  # would take this long.
+  check "call returns within a bounded time, not hung forever" \
+    "$([[ $elapsed -lt 60 ]] && echo bounded || echo unbounded)" "bounded"
+  check "status is failure" "$(field "$result" status)" "failure"
+  check "error.code is LIST_EXTENSIONS_FAILED" "$(nested_field "$result" error code)" "LIST_EXTENSIONS_FAILED"
+  restore_code_binary
+  echo "  ==> Real code binary/code.cmd restored"
+else
+  skip "a real, indefinitely-hung code invocation is detected, killed, and reported" \
+    "could not safely stub the code binary (see the error above)"
+fi
 fi
 echo
 echo "$PASS passed, $FAIL failed"

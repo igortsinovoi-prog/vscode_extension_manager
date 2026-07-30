@@ -204,6 +204,47 @@ function Resolve-VSCodeSafePath {
 # (like shell's 2>&1) - same rationale as the macOS side's single-NSPipe
 # approach: simpler, and sidesteps any risk of a full stderr buffer
 # deadlocking a caller that's only draining stdout.
+# Win32/CommandLineToArgvW-compatible argument quoting (the same algorithm
+# .NET's own ProcessStartInfo.ArgumentList uses internally to build the
+# actual native command line) - needed because ArgumentList itself is
+# unavailable here (see Invoke-VSCodeNativeCommand's own comment on why).
+# Only quotes an argument that actually needs it (contains whitespace or a
+# literal quote); backslashes are only special immediately before a quote
+# (a literal trailing backslash in a path, e.g. "C:\Program Files\", is
+# NOT doubled unless what follows is a quote).
+function ConvertTo-VSCodeQuotedArgument {
+  param([string]$Argument)
+  if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') {
+    return $Argument
+  }
+  $sb = New-Object System.Text.StringBuilder
+  [void]$sb.Append('"')
+  for ($i = 0; $i -lt $Argument.Length; $i++) {
+    $backslashCount = 0
+    while ($i -lt $Argument.Length -and $Argument[$i] -eq '\') {
+      $backslashCount++
+      $i++
+    }
+    if ($i -eq $Argument.Length) {
+      [void]$sb.Append('\' * ($backslashCount * 2))
+      break
+    } elseif ($Argument[$i] -eq '"') {
+      [void]$sb.Append('\' * ($backslashCount * 2 + 1))
+      [void]$sb.Append('"')
+    } else {
+      [void]$sb.Append('\' * $backslashCount)
+      [void]$sb.Append($Argument[$i])
+    }
+  }
+  [void]$sb.Append('"')
+  return $sb.ToString()
+}
+
+function ConvertTo-VSCodeArgumentString {
+  param([string[]]$Arguments)
+  return (($Arguments | ForEach-Object { ConvertTo-VSCodeQuotedArgument $_ }) -join ' ')
+}
+
 function Invoke-VSCodeNativeCommand {
   param(
     [Parameter(Mandatory)][string]$FilePath,
@@ -228,7 +269,18 @@ function Invoke-VSCodeNativeCommand {
 
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $launchPath
-    foreach ($a in $launchArgs) { $psi.ArgumentList.Add($a) }
+    # .Arguments (a single pre-quoted string), not .ArgumentList.Add() -
+    # real bug found via a live windows-rtr run: .ArgumentList is $null
+    # under this box's Windows PowerShell 5.1 (real production RTR
+    # deployments run under plain `powershell.exe`, i.e. 5.1, not `pwsh` -
+    # this had gone uncaught because the windows-remote/SSH test path only
+    # ever exercised it under a bootstrapped pwsh 7, which a real target
+    # machine has no reason to have), throwing "You cannot call a method
+    # on a null-valued expression." on literally the first CLI call of any
+    # real deployment. ConvertTo-VSCodeArgumentString reproduces the same
+    # quoting ArgumentList would have applied, so this is not a behavior
+    # change on hosts where ArgumentList did work.
+    $psi.Arguments = ConvertTo-VSCodeArgumentString $launchArgs
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError  = $true
     $psi.UseShellExecute        = $false
@@ -251,7 +303,33 @@ function Invoke-VSCodeNativeCommand {
 
     $exited = $proc.WaitForExit($TimeoutSec * 1000)
     if (-not $exited) {
-      try { $proc.Kill($true) } catch {}
+      # Process.Kill($true) (kills the entire child-process tree) is a
+      # .NET Core/.NET 5+-only overload - it does not exist under real
+      # RTR's actual runtime (powershell.exe 5.1, .NET Framework), where
+      # calling it throws a MethodException that the bare catch below
+      # used to silently swallow - meaning a timed-out process was NEVER
+      # actually killed on real RTR, just left running forever.
+      #
+      # The correct fallback is NOT a plain single-process Kill() - code.cmd
+      # is always launched via cmd.exe /d /c (see $launchPath above), so
+      # $proc here is that cmd.exe wrapper, not the real work. Confirmed
+      # directly: killing just the wrapper leaves its own children (the
+      # console host AND the actual long-running process, e.g. a real
+      # hung `code` invocation) still running indefinitely - an orphan,
+      # not a fix. taskkill /T /F recursively kills the whole tree by pid
+      # and is available on every Windows PowerShell version since it
+      # shells out to a separate, always-present executable rather than
+      # relying on any particular Process API surface.
+      try {
+        $proc.Kill($true)
+      } catch {
+        try {
+          Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', $proc.Id, '/T', '/F') `
+            -Wait -WindowStyle Hidden -ErrorAction Stop
+        } catch {
+          try { $proc.Kill() } catch {}
+        }
+      }
     }
     # Per .NET's own guidance for redirected-stream processes: call the
     # parameterless overload after the timed one so the async output pump

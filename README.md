@@ -52,36 +52,61 @@ registered, triggered, and unregistered again immediately
 ## Running everything
 
 `run_all_tests.sh` (repo root) is a single entry point that runs every
-suite in this repo, in order: both platforms' mocked suites
-(`js_scripts/run_all_tests.sh`, `ps_scripts/run_all_tests.sh --target
-windows-remote`), then both platforms' real-world checks (see below,
-`--platform mac` / `--platform windows-remote`) - printing a pass/fail
-summary at the end. `windows-remote` is used for the `ps_scripts` mocked
-suite (not `--target local`) because `pwsh` isn't installable on this
-project's actual dev machine (Tier-3/macOS-12, confirmed unsupported);
-the same Windows VM already needed for the real-world checks covers it
-too. Every stage runs regardless of an earlier stage's failure, so one
-broken suite doesn't hide problems in the others - the exit code reflects
-whether *all* stages passed. Each stage's full output is both shown live
-and saved to its own log file under `test_logs/<timestamp>/` (also
+suite in this repo across any number of named machines: `mac` (this
+machine) plus any number of Windows targets, each declared once in
+`.env.local` and selectable by name. For each selected Windows target it
+runs both the mocked suite (`ps_scripts/run_all_tests.sh --target
+windows`) and the real-world check (`--platform windows` below);
+`--target windows` is used for the mocked suite too (not `--target
+local`) because `pwsh` isn't installable on this project's actual dev
+machine (Tier-3/macOS-12, confirmed unsupported) - each configured
+Windows box covers its own mocked-suite run instead. Every stage runs
+regardless of an earlier stage's failure, so one broken suite doesn't
+hide problems in the others - the exit code reflects whether *all*
+stages passed. Each stage's full output is both shown live and saved to
+its own log file under `test_logs/<timestamp>/` (also
 `test_logs/latest/`), so a failure can be diagnosed from the log
 afterward without re-running anything.
 
-```bash
-./run_all_tests.sh --host <windows-ip> --user <windows-user> --password <pw>
-sudo ./run_all_tests.sh --host <windows-ip> --user <windows-user> --password <pw>   # + mac root-fallback coverage
+Windows targets are declared in `.env.local`, not passed as flags -
+add a third Windows box later by adding one name and one block, no
+script changes:
 
-# + real-RTR stages (see "Testing via real RTR" below):
-./run_all_tests.sh --host <ip> --user <user> --password <pw> --rtr --device-aid <aid>
+```bash
+# .env.local
+WIN_TARGETS="win10 win11"
+
+WIN10_HOST=20.55.29.165
+WIN10_USER=abuyam
+WIN10_PORT=2222              # optional, defaults to 22
+WIN10_PASSWORD=...           # or WIN10_KEY=~/.ssh/...
+WIN10_DEVICE_AID=...         # optional - omit to skip this target's -rtr stage
+
+WIN11_HOST=192.168.64.4
+WIN11_USER=abuyam
+WIN11_KEY=~/.ssh/utm_windows_vm
+WIN11_DEVICE_AID=...
 ```
 
-Pass `--rtr` to also run the real-world checks over an actual CrowdStrike
-Falcon RTR session (`--platform mac-rtr`) - additive, not a replacement:
-the direct-invocation real-world checks above still run every time. See
-"Testing via real RTR" under "Real-world check" below for what this
-needs and why it exists. `windows-rtr` isn't implemented yet; `--rtr`
-prints a note and skips it rather than pretending to run something that
-doesn't exist.
+```bash
+./run_all_tests.sh                          # mac + every configured Windows target
+sudo ./run_all_tests.sh                      # + mac root-fallback coverage
+./run_all_tests.sh --targets mac,win10       # just those two
+./run_all_tests.sh --targets win11
+
+# + real-RTR stages (see "Testing via real RTR" below):
+./run_all_tests.sh --rtr
+```
+
+Pass `--rtr` to also run each selected target's real-world check over an
+actual CrowdStrike Falcon RTR session (`mac-rtr` / `<name>-rtr`) -
+additive, not a replacement: the direct-invocation real-world checks
+above still run every time. See "Testing via real RTR" under
+"Real-world check" below for what this needs and why it exists. A
+selected target missing its device AID (`MAC_DEVICE_AID` /
+`<NAME>_DEVICE_AID` in `.env.local`) has its `-rtr` stage skipped with a
+note rather than erroring, so `--rtr` still works fine when only some
+targets have a sensor enrolled yet.
 
 ## Real-world check (shared, both platforms)
 
@@ -93,21 +118,31 @@ not part of either platform's regular test suite. The 17 scenarios and
 their assertions are identical regardless of platform; only how each
 individual command actually runs (invoking the real `code` CLI, invoking
 the deployed script under test) differs, selected via `--platform`. It
-always runs as bash on the Mac - for `--platform windows-remote` it drives
+always runs as bash on the Mac - for `--platform windows` it drives
 a real Windows box over SSH rather than requiring bash on Windows.
 
 ```bash
 ./real_world_check_set_vscode_extension_version.sh --platform mac
 sudo ./real_world_check_set_vscode_extension_version.sh --platform mac   # + root-fallback scenarios
 
-./real_world_check_set_vscode_extension_version.sh --platform windows-remote \
+./real_world_check_set_vscode_extension_version.sh --platform windows \
   --host <ip> --user <admin-user> --key ~/.ssh/id_ed25519   # key auth
-./real_world_check_set_vscode_extension_version.sh --platform windows-remote \
+./real_world_check_set_vscode_extension_version.sh --platform windows \
   --host <ip> --user <admin-user> --password <pw>           # or password auth (needs sshpass)
+./real_world_check_set_vscode_extension_version.sh --platform windows \
+  --host <ip> --user <admin-user> --password <pw> --port 2222   # non-default SSH port
 
 ./real_world_check_set_vscode_extension_version.sh --platform mac-rtr \
   --device-aid <aid>   # + FALCON_CLIENT_ID/SECRET in env or .env.local - see "Testing via real RTR" below
+./real_world_check_set_vscode_extension_version.sh --platform windows-rtr \
+  --host <ip> --user <admin-user> --password <pw> --port 2222 --device-aid <aid>
 ```
+
+This script itself always targets exactly one machine per invocation
+(host/user/port/auth/device-aid are plain flags, as above) - it has no
+concept of named targets. `run_all_tests.sh` is what adds the
+`.env.local`-driven `win10`/`win11`/... naming on top, by invoking this
+script once per selected target (see "Running everything" above).
 
 It captures the extension's original install state up front and restores
 it on exit regardless of pass/fail - each cleanup step is guarded
@@ -115,51 +150,78 @@ independently, so one step erroring (e.g. a transient SSH hiccup) can
 never block the far more important step of restoring the extension's
 original install state.
 
-### Testing via real RTR (`--platform mac-rtr`)
+### Testing via real RTR (`--platform mac-rtr` / `windows-rtr`)
 
-The direct-invocation `--platform mac` above runs the deployed script
-locally, as the interactive user - a genuinely different code path from
-how this actually ships in production (a CrowdStrike Falcon RTR
-`runscript` invocation, running as root against whatever session happens
-to be logged in). `--platform mac-rtr` drives that real path instead:
-real put-file upload, a real RTR session against a real sensor-enrolled
-device, real `runscript` invocation and polling - self-targeting this
-same Mac. This is not redundant with `--platform mac`: it's what actually
-surfaced two real macOS bugs neither direct invocation nor the mocked
-suites ever could (an inherited working directory the target user can't
-access, and a spawned command's timeout that could never actually fire -
-see `dist/README.md`'s "Bugs found" for both). `windows-rtr` doesn't
-exist yet.
+The direct-invocation `--platform mac`/`windows` above run the
+deployed script locally/over plain SSH, as the interactive/admin user -
+a genuinely different code path from how this actually ships in
+production (a CrowdStrike Falcon RTR `runscript` invocation, running as
+root/SYSTEM against whatever session happens to be logged in).
+`--platform mac-rtr`/`windows-rtr` drive that real path instead: real
+put-file upload, a real RTR session against a real sensor-enrolled
+device, real `runscript` invocation and polling. This is not redundant
+with the direct-invocation platforms: on mac, it's what actually
+surfaced two real bugs neither direct invocation nor the mocked suites
+ever could (an inherited working directory the target user can't access,
+and a spawned command's timeout that could never actually fire - see
+`dist/README.md`'s "Bugs found" for both); `windows-rtr` exercises the
+SYSTEM-identity fallback path on Windows for real for the first time,
+the same way `mac-rtr` already does on mac.
 
 ```bash
 FALCON_CLIENT_ID=... FALCON_CLIENT_SECRET=... \
 ./real_world_check_set_vscode_extension_version.sh --platform mac-rtr \
   --device-aid <sensor-enrolled-device-aid>
+
+FALCON_CLIENT_ID=... FALCON_CLIENT_SECRET=... \
+./real_world_check_set_vscode_extension_version.sh --platform windows-rtr \
+  --host <ip> --user <admin-user> --password <pw> --port 2222 \
+  --device-aid <sensor-enrolled-device-aid>
 ```
 
-Needs `--device-aid` (the target device) and `FALCON_CLIENT_ID`/
+Both need `--device-aid` (the target device) and `FALCON_CLIENT_ID`/
 `FALCON_CLIENT_SECRET` in the environment - **never as flags**: argv is
 visible in shell history and to any other process on the machine via
-`ps` (see `rtr_token()`'s own comment). Both can instead live in a local,
-git-ignored `.env.local` at the repo root (`MAC_DEVICE_AID=...`,
-`FALCON_CLIENT_ID=...`, `FALCON_CLIENT_SECRET=...`) - auto-loaded by both
-this script and `run_all_tests.sh --rtr` if present, so a real RTR run
-doesn't need any of that re-entered by hand each time. Recover a device
-AID from the Falcon console (Host Management) or the Falcon API's own
+`ps` (see `rtr_token()`'s own comment). All of these can instead live in
+a local, git-ignored `.env.local` at the repo root (`MAC_DEVICE_AID=...`,
+`WIN10_DEVICE_AID=...`, `FALCON_CLIENT_ID=...`,
+`FALCON_CLIENT_SECRET=...` - see "Running everything" above for the full
+per-target schema) - auto-loaded by both this script and
+`run_all_tests.sh --rtr` if present, so a real RTR run doesn't need any
+of that re-entered by hand each time. Recover a device AID from the
+Falcon console (Host Management) or the Falcon API's own
 `devices-scroll` query filtered by hostname/serial number; recover the
 API credentials from wherever your team keeps them - neither is
 derivable from anything else in this repo, and `.env.local` is never
 committed.
 
-`--platform windows-remote` drives everything from the Mac side over SSH
-to an admin account on the Windows box: `bootstrap_remote_windows.ps1`
+`--platform windows`/`windows-rtr` drive everything from the Mac
+side over SSH to an admin account on the Windows box (or, for
+`windows-rtr`, a mix of SSH for harness setup/assertions and a real RTR
+session for the actual deployment under test - see
+`rtr_run_dist_script_windows`'s own comment): `bootstrap_remote_windows.ps1`
 (piped over SSH) installs `pwsh` there if missing, `ps_scripts/build.sh`
-builds the deployable script locally (no `pwsh` needed on the Mac), `scp`
-copies just that one file over, and it's deleted again when the run
-finishes. Also reachable via `js_scripts/run_all_tests.sh
---with-real-world-test` (which runs it with `--platform mac` after the
-mocked suite) or the repo-root `run_all_tests.sh` (both platforms, plus
-both mocked suites - see "Running everything" above).
+builds the deployable script locally (no `pwsh` needed on the Mac), and
+either `scp` copies just that one file over (`windows`) or it's
+uploaded as an RTR put-file (`windows-rtr`); either way it's cleaned up
+again when the run finishes. Also reachable via
+`js_scripts/run_all_tests.sh --with-real-world-test` (which runs it with
+`--platform mac` after the mocked suite) or the repo-root
+`run_all_tests.sh` (every configured target, plus every mocked suite -
+see "Running everything" above).
+
+**A non-default SSH port needs `--port`** (or `<NAME>_PORT` in
+`.env.local` when going through `run_all_tests.sh`) - not every Windows
+box answers SSH on 22. Confirmed real on the `win10` target: its NSG,
+Windows Firewall, and `sshd` are all correctly configured for port 22,
+but Azure appears to block inbound 22 specifically at the platform level
+regardless (reproduced from three independent networks including Azure
+Cloud Shell itself) - a second `sshd` listener on 2222 with an otherwise
+identical setup works instantly. If a Windows target ever behaves this
+way, check whether it's actually a listener/firewall/NSG problem first
+(this repeatedly wasn't, here), and if everything checks out and it's
+still unreachable, try a non-default port before assuming the box itself
+is broken.
 
 ### Scenarios 15 and 16: VS Code's own background behavior
 
@@ -276,10 +338,10 @@ do without touching anything.
 | `ps_scripts/lib/Set-VSCodeExtensionVersion.Policy.ps1` | Same pure decision logic as the macOS policy module, ported 1:1 (extension id/version validation, installed-list parsing, the version-action decision, the outcome computation) - just a Windows path shape (`<drive>:\Users\<user>\.vscode\extensions\<leaf>`) for the extension-path parser. |
 | `ps_scripts/lib/Set-VSCodeExtensionVersion.Runner.ps1` | OS-interaction glue - RTR contract, `code.cmd` discovery, path-safety checks, diagnostics. **Differs from macOS in three deliberate ways.** (1) Instead of impersonating the target user (there's no lightweight Windows equivalent of `launchctl asuser` short of token-duplication tricks), it runs `code.cmd` as whatever identity launched the script (typically SYSTEM under RTR) and passes the target user's extensions folder explicitly via VS Code CLI's own `--extensions-dir` flag. The fallback-when-unresolvable case points at SYSTEM's own (normally empty) extensions dir under `%SystemRoot%\System32\config\systemprofile`, the Windows analogue of the macOS side's `HOME=/var/root` isolation fix. (2) It also passes `--user-data-dir`, derived from `--extensions-dir` (never a separate parameter, never a different identity's profile) - real-world finding: the marketplace only serves a signature for an extension's *current latest* version, so pinning any older version (the entire point of this script's `--version` support) fails with "Signature verification failed: NotSigned" otherwise. `extensions.verifySignature` is temporarily set to `false` in that identity's own `settings.json` for the duration of each CLI call only, then the exact original raw file content is restored immediately after (or the file deleted if it didn't exist before) - never left changed, never touching a different user's settings. (3) `Restart-VSCodeIfRunning` - same "restart after a real, changed update" behavior as the macOS side, but since this script never impersonates anyone, relaunching a GUI process into an arbitrary *other* user's session needs a different mechanism than starting a new process: a one-shot Scheduled Task with `-LogonType Interactive`, registered, triggered, and unregistered again immediately (the supported way to start a process in another user's real interactive session without token impersonation/duplication). |
 | `ps_scripts/build.ps1` | Concatenates each `lib/*.Policy.ps1` + `*.Runner.ps1` pair into `ps_scripts/dist/<name>.ps1`. |
-| `ps_scripts/build.sh` | Same output as `build.ps1` (plain text concatenation, byte-for-byte), for building on a machine without `pwsh` - e.g. building on the Mac to deploy just the resulting single file onto a remote Windows box. Used by `real_world_check_set_vscode_extension_version.sh --platform windows-remote`. |
+| `ps_scripts/build.sh` | Same output as `build.ps1` (plain text concatenation, byte-for-byte), for building on a machine without `pwsh` - e.g. building on the Mac to deploy just the resulting single file onto a remote Windows box. Used by `real_world_check_set_vscode_extension_version.sh --platform windows`. |
 | `ps_scripts/run_all_tests.ps1` | Runs the Pester suite under `ps_scripts/tests/` natively. Requires Pester 5+ (`Install-Module Pester -Scope CurrentUser -MinimumVersion 5.0.0`). |
-| `ps_scripts/run_all_tests.sh` | Runs that same suite either locally (if `pwsh` is on this machine's PATH: `--target local`) or remotely over SSH against a real Windows box (`--target windows-remote --host <ip> --user <user> (--key <path> \| --password <pw>)`) - mirrors the real-world check's remote plumbing; copies only `lib/`, `tests/`, and `run_all_tests.ps1` (no git needed on the remote box), bootstraps `pwsh` + Pester there if missing, and cleans up the scratch directory afterward. |
-| `ps_scripts/bootstrap_remote_windows.ps1` | Idempotent: ensures `pwsh` is present on a remote Windows box. Piped over SSH by both `run_all_tests.sh` and the real-world check's `--platform windows-remote`. Must stay Windows-PowerShell-5.1-compatible, since `pwsh` may not exist yet the first time it runs. |
+| `ps_scripts/run_all_tests.sh` | Runs that same suite either locally (if `pwsh` is on this machine's PATH: `--target local`) or remotely over SSH against a real Windows box (`--target windows --host <ip> --user <user> (--key <path> \| --password <pw>)`) - mirrors the real-world check's remote plumbing; copies only `lib/`, `tests/`, and `run_all_tests.ps1` (no git needed on the remote box), bootstraps `pwsh` + Pester there if missing, and cleans up the scratch directory afterward. |
+| `ps_scripts/bootstrap_remote_windows.ps1` | Idempotent: ensures `pwsh` is present on a remote Windows box. Piped over SSH by both `run_all_tests.sh` and the real-world check's `--platform windows`. Must stay Windows-PowerShell-5.1-compatible, since `pwsh` may not exist yet the first time it runs. |
 | `ps_scripts/tests/Set-VSCodeExtensionVersion.Policy.Tests.ps1` | Pester suite for the policy module - mirrors the macOS policy test suite's coverage scenario-for-scenario. |
 | `ps_scripts/tests/Set-VSCodeExtensionVersion.Runner.Tests.ps1` | Mocked Pester suite for the runner module (mocks the single process-invocation seam plus the small filesystem seams) - mirrors the macOS runner test suite's coverage, plus dedicated tests pinning the JSON envelope's exact field casing and the signature-verification bypass's enable/restore behavior. |
 | `ps_scripts/tests/watch_and_launch_vscode.ps1` | Watches for trigger files and launches/kills a real VS Code GUI window in response - meant to run inside an actual interactive Windows session, not over SSH. Exists because SSH lands in the non-interactive Session 0, where a directly-launched `Code.exe` never renders a window; this is how the real-world check's scenario 15 gets a real, rendering VS Code session to observe despite driving everything else over SSH. Self-cleaning: each trigger file is deleted immediately after being acted on. |
@@ -292,7 +354,7 @@ do without touching anything.
 
 ```bash
 ps_scripts/run_all_tests.sh --target local
-ps_scripts/run_all_tests.sh --target windows-remote --host <ip> --user <admin-user> --password <pw>
+ps_scripts/run_all_tests.sh --target windows --host <ip> --user <admin-user> --password <pw>
 ```
 
 Running the deployed script directly against a real machine:
@@ -309,7 +371,7 @@ do without touching anything.
 
 **Verified on real hardware** - a UTM VM (Windows 11 ARM64, driven over
 SSH from the Mac; see the two scripts' `--platform`/`--target
-windows-remote`) and the Mac itself, not just the mocked suites.
+windows`) and the Mac itself, not just the mocked suites.
 
 The Windows side was originally written and reviewed line-by-line with no
 Windows machine available yet, which did catch several real bugs before

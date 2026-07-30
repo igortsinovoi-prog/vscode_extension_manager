@@ -26,7 +26,27 @@ if (Get-Command pwsh -ErrorAction SilentlyContinue) {
   Write-Output "Installing PowerShell 7 via winget..."
   winget install --id Microsoft.PowerShell -e --silent --accept-package-agreements --accept-source-agreements
   if ($LASTEXITCODE -ne 0) {
-    throw "winget install Microsoft.PowerShell failed with exit code $LASTEXITCODE"
+    # Real, confirmed failure mode on a fresh Windows box (never seen an
+    # interactive winget session before): its source index has "Updated:
+    # never" and every winget operation - install, `source update`, even
+    # with --disable-interactivity or after `source reset` - fails with
+    # "Failed when opening source(s)" / "Cancelled", regardless of which
+    # source (winget or msstore) is targeted. Not a network problem (the
+    # CDN itself is reachable) and not fixable by any winget flag found -
+    # fall back to installing the MSI directly from the GitHub release
+    # instead of depending on winget's source machinery at all.
+    Write-Output "winget install failed (exit $LASTEXITCODE) - falling back to a direct MSI install from GitHub."
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/PowerShell/PowerShell/releases/latest"
+    $asset = $release.assets | Where-Object { $_.name -like "*win-x64.msi" } | Select-Object -First 1
+    $msiPath = "$env:TEMP\PowerShell-win-x64.msi"
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $msiPath
+    $proc = Start-Process msiexec.exe -ArgumentList "/i", $msiPath, "/quiet", "/norestart", `
+      "ADD_EXPLORER_CONTEXT_MENU_OPENPOWERSHELL=0", "ADD_FILE_CONTEXT_MENU_RUNPOWERSHELL=0", `
+      "ENABLE_PSREMOTING=0", "REGISTER_MANIFEST=0" -Wait -PassThru
+    Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
+    if ($proc.ExitCode -ne 0) {
+      throw "PowerShell 7 MSI install failed with exit code $($proc.ExitCode) (after winget install also failed with $LASTEXITCODE)"
+    }
   }
   Write-Output "PowerShell 7 installed."
 }
