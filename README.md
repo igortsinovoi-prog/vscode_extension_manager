@@ -60,8 +60,9 @@ owned by a different login session, and RTR always runs non-interactively
 actually rendering VS Code's window - confirmed directly against a real
 window under a real RTR-shaped session, every `Code.exe` process showed
 `MainWindowHandle=0` from that vantage point. Kept anyway (a real no-op
-safety margin, not reverted to an immediate force-kill) - see `dist/README.md`
-for the full writeup and what this means for a real deployment: unsaved
+safety margin, not reverted to an immediate force-kill) - see
+`dist/windows/README.md` for the full writeup and what this means for a
+real deployment: unsaved
 work in the target user's VS Code window is lost when a real, changed
 version update forces a restart while it's open. No such gap exists on
 macOS, where `launchctl asuser` genuinely reaches the target session for a
@@ -182,7 +183,7 @@ with the direct-invocation platforms: on mac, it's what actually
 surfaced two real bugs neither direct invocation nor the mocked suites
 ever could (an inherited working directory the target user can't access,
 and a spawned command's timeout that could never actually fire - see
-`dist/README.md`'s "Bugs found" for both); `windows-rtr` exercises the
+`dist/mac/README.md`'s "Build log" for both); `windows-rtr` exercises the
 SYSTEM-identity fallback path on Windows for real for the first time,
 the same way `mac-rtr` already does on mac.
 

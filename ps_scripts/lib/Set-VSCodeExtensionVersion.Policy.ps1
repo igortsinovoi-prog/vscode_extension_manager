@@ -11,6 +11,8 @@
 # directory layout consistent with the macOS side.
 # =====================================================================
 
+Set-StrictMode -Version Latest
+
 # VS Code extension ids are "<publisher>.<name>", each segment alphanumeric
 # plus hyphens (e.g. "ms-python.python", "GitHub.copilot"). Same on every OS
 # - this is a marketplace id format, not a filesystem concept.
@@ -164,6 +166,23 @@ function Get-VSCodeVersionAction {
   return [PSCustomObject]@{ Action = 'set_version'; InstalledVersion = $current }
 }
 
+# Safe property access for $ActionResult below - unlike bare `$Obj.Name`,
+# this never throws under Set-StrictMode even when $Obj genuinely lacks the
+# named property (as opposed to having it explicitly set to $null, which
+# needs no special handling either way - both come back as $Default). Kept
+# local to this file (duplicating Runner.ps1's own Get-VSCodeProp, which
+# does the same thing for a different purpose - reading optional JSON
+# input fields) rather than shared, since this file's own header comment
+# promises it stays a fully standalone, pure, no-dependencies module,
+# dot-sourceable on its own under Pester without Runner.ps1 in scope.
+function Get-VSCodePolicyProp {
+  param($Obj, [string]$Name, $Default)
+  if ($null -eq $Obj) { return $Default }
+  $prop = $Obj.PSObject.Properties[$Name]
+  if ($null -eq $prop -or $null -eq $prop.Value) { return $Default }
+  return $prop.Value
+}
+
 # Pure decision function: given the decision from Get-VSCodeVersionAction,
 # the raw result of whatever CLI action was attempted (or $null if none was -
 # i.e. Decision.Action was 'not_installed' or 'already_correct_version'), the
@@ -175,23 +194,33 @@ function Get-VSCodeVersionAction {
 #
 # $ActionResult shape (or $null): @{ Attempted = bool; Ok = bool; Stderr = string }
 #   Attempted is $false for a dry run (the runner skips the real CLI call).
+#   Every real $ActionResult the runner actually constructs (see
+#   Invoke-VSCodeUpgradeToLatest/Invoke-VSCodeSetExactVersion) always
+#   populates all three keys - but this function's own contract does not
+#   require that (it's a pure/standalone-testable function, exercised
+#   directly under Pester with hand-built objects too), so it reads them
+#   defensively via Get-VSCodePolicyProp rather than assuming they're
+#   there. PowerShell's `-and` does NOT short-circuit (see this file's
+#   own Test-VSCodeExtensionId comment) - both operands of an -and always
+#   evaluate, so accessing $ActionResult.Ok directly even when Attempted
+#   is $false would throw under Set-StrictMode the moment a caller passes
+#   an object that only sets Attempted (exactly what the dry-run tests
+#   below do) - not just a theoretical concern, that combination is this
+#   function's own documented dry-run contract.
 function Get-VSCodeRunOutcome {
   param($Decision, $ActionResult, $InstalledVersionAfter, [bool]$DryRun)
 
-  $actionFailed = $false
-  if ($ActionResult -and $ActionResult.Attempted -and -not $ActionResult.Ok) {
-    $actionFailed = $true
-  }
+  $attempted = Get-VSCodePolicyProp $ActionResult 'Attempted' $false
+  $ok        = Get-VSCodePolicyProp $ActionResult 'Ok' $false
+  $stderr    = Get-VSCodePolicyProp $ActionResult 'Stderr' ''
+
+  $actionFailed = ($attempted -and -not $ok)
   $changed = $false
-  if ($ActionResult -and $ActionResult.Attempted -and $ActionResult.Ok) {
+  if ($attempted -and $ok) {
     $changed = ($InstalledVersionAfter -ne $Decision.InstalledVersion)
   }
 
   if ($actionFailed) {
-    # Property access on an object that lacks this NoteProperty returns
-    # $null (not an error) under PowerShell's default, non-strict mode.
-    $stderr = $ActionResult.Stderr
-    if (-not $stderr) { $stderr = '' }
     return [PSCustomObject]@{
       Status  = 'failure'
       Changed = $false

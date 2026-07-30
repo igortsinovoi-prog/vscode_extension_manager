@@ -112,6 +112,10 @@ function resetMocks() {
     // then repeatedly in the wait loop).
     vscodeRunningSequence: [false],
     psCallIndex: 0,
+    // Exit code for the final `open -a 'Visual Studio Code'` relaunch
+    // call - defaults to success; a dedicated test overrides this to
+    // simulate a genuine relaunch failure.
+    openExitCode: 0,
   };
   commandLog = [];
   fileWriteLog = [];
@@ -205,7 +209,7 @@ function standardMockRunCommand(launchPath, args, timeoutSec) {
     return { exitCode: 0, stdout: '', stderr: '' };
   }
   if (launchPath === '/bin/launchctl' && args[0] === 'asuser' && args[2] === '/usr/bin/sudo' && args[6] === '/usr/bin/open') {
-    return { exitCode: 0, stdout: '', stderr: '' };
+    return { exitCode: mockConfig.openExitCode, stdout: '', stderr: '' };
   }
   if (launchPath === '/bin/sleep') {
     return { exitCode: 0, stdout: '', stderr: '' };
@@ -482,6 +486,27 @@ test('restartVSCodeIfRunning: still running after the wait loop -> force-kills b
   assertEqual(openCall.length, 1);
 });
 
+test('restartVSCodeIfRunning: relaunch (open -a) genuinely fails -> returns false, not just true because processes were found and killed', function () {
+  // Matches the equivalent Windows fix: vscode_restarted must reflect
+  // whether the relaunch itself actually succeeded, not just that VS
+  // Code was found running and something was attempted.
+  mockConfig.vscodeRunningSequence = [true, false];
+  mockConfig.openExitCode = 1;
+  var result = restartVSCodeIfRunning(501);
+  assertEqual(result, false);
+
+  // The quit was still attempted...
+  var quitCall = commandLog.filter(function (c) {
+    return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[6] === '/usr/bin/osascript';
+  });
+  assertEqual(quitCall.length, 1);
+  // ...and open -a was still attempted, it just failed.
+  var openCall = commandLog.filter(function (c) {
+    return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[6] === '/usr/bin/open';
+  });
+  assertEqual(openCall.length, 1);
+});
+
 // ---------------------------------------------------------------------------
 // upgradeToLatest / setExactVersion dry-run gating
 // ---------------------------------------------------------------------------
@@ -552,12 +577,28 @@ test('run(): invalid extension_id -> failure envelope, INVALID_PARAMS', function
   var result = JSON.parse(run(makeArgv({ extension_id: 'not-an-id' }, true)));
   assertEqual(result.status, 'failure');
   assertEqual(result.error.code, 'INVALID_PARAMS');
+  // Failure envelopes mirror the success envelope's own full field list -
+  // whatever was already figured out before the failure (here, just the
+  // raw invalid extension_id itself) is reported as-is; everything not
+  // yet reached stays at its safe "not yet known" default rather than
+  // just being absent, so a caller never has to special-case a failure
+  // envelope's shape vs. a success one's.
+  assertEqual(result.extension_id, 'not-an-id');
+  assertEqual(result.target_version, null);
+  assertEqual(result.extension_path, null);
+  assertEqual(result.action, null);
+  assertEqual(result.target_user, null);
+  assertEqual(result.ran_as_root, true);
+  assertEqual(result.cli_result, null);
+  assertEqual(result.vscode_restarted, false);
 });
 
 test('run(): invalid version -> failure envelope, INVALID_PARAMS', function () {
   var result = JSON.parse(run(makeArgv({ extension_id: 'ms-python.python', version: 'not-semver' }, true)));
   assertEqual(result.status, 'failure');
   assertEqual(result.error.code, 'INVALID_PARAMS');
+  assertEqual(result.extension_id, 'ms-python.python');
+  assertEqual(result.target_version, 'not-semver');
 });
 
 test('run(): VS Code not installed -> failure envelope, VSCODE_NOT_INSTALLED', function () {
@@ -565,6 +606,13 @@ test('run(): VS Code not installed -> failure envelope, VSCODE_NOT_INSTALLED', f
     var result = JSON.parse(run(makeArgv({ extension_id: 'ms-python.python', extension_path: JDOE_PATH }, true)));
     assertEqual(result.status, 'failure');
     assertEqual(result.error.code, 'VSCODE_NOT_INSTALLED');
+    // On mac this check fires before extension_path is even read (see
+    // run()'s own ordering) - unlike Windows, which resolves the target
+    // user first. Both still stay at their safe "not yet known"
+    // defaults here rather than being absent from the envelope.
+    assertEqual(result.extension_id, 'ms-python.python');
+    assertEqual(result.extension_path, null);
+    assertEqual(result.target_user, null);
   });
 });
 
@@ -577,6 +625,11 @@ test('run(): code --list-extensions itself fails -> failure envelope, LIST_EXTEN
     )));
     assertEqual(result.status, 'failure');
     assertEqual(result.error.code, 'LIST_EXTENSIONS_FAILED');
+    assertEqual(result.extension_id, 'ms-python.python');
+    assertEqual(result.target_version, '2024.1.0');
+    assertEqual(result.extension_path, JDOE_PATH);
+    assertEqual(result.target_user, 'jdoe');
+    assertEqual(result.ran_as_root, false);
   });
 });
 

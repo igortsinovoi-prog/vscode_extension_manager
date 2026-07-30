@@ -1515,6 +1515,19 @@ PS
     ;;
 esac
 
+# The envelope field name for "user resolution fell back off the real
+# target user" differs by platform: mac genuinely runs the fallback as
+# root (RTR's own execution identity there), so `ran_as_root` is
+# literally accurate; Windows always runs under SYSTEM regardless (RTR
+# has no mac-style impersonation), so the same concept there is really
+# "did we fall back to SYSTEM's own isolated extensions dir" - renamed
+# to `used_system_fallback` to match this file's own SYSTEM-fallback
+# terminology instead of reusing a mac-flavored name that never applied.
+RAN_AS_ROOT_FIELD="ran_as_root"
+if [[ "$PLATFORM" == windows* ]]; then
+  RAN_AS_ROOT_FIELD="used_system_fallback"
+fi
+
 MISMATCHED_ID_PATH="${EXT_PATH_PREFIX}${PATH_SEP}some-other.extension-0.0.0"
 SYMLINK_PATH="${EXT_PATH_PREFIX}${PATH_SEP}${EXT_ID}-9.9.9-symlinktest"
 USER_EXTENSION_PATH="${EXT_PATH_PREFIX}${PATH_SEP}${EXT_ID}-0.0.0"  # shape only; leaf need not exist
@@ -1911,7 +1924,7 @@ set_installed_version "0.4.0"
 result="$(run_script "" "false" "$USER_EXTENSION_PATH")"
 echo "  envelope: $result"
 check "target_user is $REAL_USER" "$(field "$result" target_user)" "$REAL_USER"
-check "ran_as_root is false" "$(field "$result" ran_as_root)" "False"
+check "$RAN_AS_ROOT_FIELD is false" "$(field "$result" "$RAN_AS_ROOT_FIELD")" "False"
 check "user_resolution_note is null" "$(field "$result" user_resolution_note)" "None"
 check "code --list-extensions independently confirms version $LATEST_VERSION" "$(get_installed_version)" "$LATEST_VERSION"
 
@@ -1932,7 +1945,7 @@ check "extension is at 0.4.0 before the run" "$(get_installed_version)" "0.4.0"
 result="$(run_script "$LATEST_VERSION" "false" "$NO_SUCH_USER_PATH")"
 echo "  envelope: $result"
 check "target_user is glow_test_no_such_user" "$(field "$result" target_user)" "glow_test_no_such_user"
-check "ran_as_root is true" "$(field "$result" ran_as_root)" "True"
+check "$RAN_AS_ROOT_FIELD is true" "$(field "$result" "$RAN_AS_ROOT_FIELD")" "True"
 check "user_resolution_note is EXTENSION_PATH_USER_NOT_FOUND" \
   "$(field "$result" user_resolution_note)" "EXTENSION_PATH_USER_NOT_FOUND"
 if [[ "$IS_ROOT" == true ]]; then
@@ -1953,7 +1966,7 @@ if setup_access_denied_profile_dir; then
   result="$(run_script "$LATEST_VERSION" "false" "$ACCESS_DENIED_USER_PATH")"
   echo "  envelope: $result"
   check "target_user is glow_test_locked_profile" "$(field "$result" target_user)" "glow_test_locked_profile"
-  check "ran_as_root is true" "$(field "$result" ran_as_root)" "True"
+  check "$RAN_AS_ROOT_FIELD is true" "$(field "$result" "$RAN_AS_ROOT_FIELD")" "True"
   check "user_resolution_note is EXTENSION_PATH_USER_PROFILE_ACCESS_DENIED (not EXTENSION_PATH_USER_NOT_FOUND - the profile genuinely exists)" \
     "$(field "$result" user_resolution_note)" "EXTENSION_PATH_USER_PROFILE_ACCESS_DENIED"
   teardown_access_denied_profile_dir
@@ -2023,7 +2036,7 @@ set_installed_version "0.4.0"
 result="$(run_script_raw "$EXT_ID" "0.4.0" "" "false")"
 echo "  envelope: $result"
 check "target_user is null" "$(field "$result" target_user)" "None"
-check "ran_as_root is true" "$(field "$result" ran_as_root)" "True"
+check "$RAN_AS_ROOT_FIELD is true" "$(field "$result" "$RAN_AS_ROOT_FIELD")" "True"
 check "user_resolution_note is MISSING_EXTENSION_PATH" "$(field "$result" user_resolution_note)" "MISSING_EXTENSION_PATH"
 # The isolated fallback identity (root's HOME=/var/root on mac; SYSTEM's own
 # profile on Windows) has no VS Code extensions of its own, regardless of
@@ -2041,7 +2054,7 @@ result="$(run_script "0.4.0" "false" "/tmp/not/a/valid/vscode/path")"
 echo "  envelope: $result"
 check "user_resolution_note is INVALID_EXTENSION_PATH" "$(field "$result" user_resolution_note)" "INVALID_EXTENSION_PATH"
 check "target_user is null" "$(field "$result" target_user)" "None"
-check "ran_as_root is true" "$(field "$result" ran_as_root)" "True"
+check "$RAN_AS_ROOT_FIELD is true" "$(field "$result" "$RAN_AS_ROOT_FIELD")" "True"
 check "run still proceeds: status is skipped (not failure)" "$(field "$result" status)" "skipped"
 
 fi
@@ -2052,7 +2065,7 @@ result="$(run_script "0.4.0" "false" "$MISMATCHED_ID_PATH")"
 echo "  envelope: $result"
 check "user_resolution_note is EXTENSION_PATH_ID_MISMATCH" "$(field "$result" user_resolution_note)" "EXTENSION_PATH_ID_MISMATCH"
 check "target_user is null" "$(field "$result" target_user)" "None"
-check "ran_as_root is true" "$(field "$result" ran_as_root)" "True"
+check "$RAN_AS_ROOT_FIELD is true" "$(field "$result" "$RAN_AS_ROOT_FIELD")" "True"
 check "run still proceeds: status is skipped (not failure)" "$(field "$result" status)" "skipped"
 
 fi
@@ -2080,7 +2093,7 @@ result="$(run_script "0.4.0" "false" "$SYMLINK_PATH")"
 echo "  envelope: $result"
 check "user_resolution_note is EXTENSION_PATH_UNSAFE" "$(field "$result" user_resolution_note)" "EXTENSION_PATH_UNSAFE"
 check "target_user is $REAL_USER (parsed from path shape, kept for diagnostics)" "$(field "$result" target_user)" "$REAL_USER"
-check "ran_as_root is true (unsafe path falls back to root, not the symlink target)" "$(field "$result" ran_as_root)" "True"
+check "$RAN_AS_ROOT_FIELD is true (unsafe path falls back off the target user, not the symlink target)" "$(field "$result" "$RAN_AS_ROOT_FIELD")" "True"
 check "run still proceeds: status is skipped (not failure)" "$(field "$result" status)" "skipped"
 
 teardown_symlink_scenario

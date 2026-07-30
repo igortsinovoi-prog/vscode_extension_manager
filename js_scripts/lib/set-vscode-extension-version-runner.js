@@ -605,7 +605,12 @@ function restartVSCodeIfRunning(uid) {
   var openResult = _runCommand('/bin/launchctl', ['asuser', String(uid), '/usr/bin/sudo', '-H', '-u', '#' + uid, '/usr/bin/open', '-a', 'Visual Studio Code']);
   writeDiag('restartVSCodeIfRunning: open command exitCode=' + openResult.exitCode +
     ' stdout=' + JSON.stringify(openResult.stdout) + ' stderr=' + JSON.stringify(openResult.stderr));
-  return true;
+  // vscode_restarted must reflect whether the relaunch itself actually
+  // succeeded, not just that VS Code was found running and something was
+  // attempted - matching the equivalent fix on the Windows side
+  // (Restart-VSCodeIfRunning only returns $true after Start-ScheduledTask
+  // itself succeeds).
+  return openResult.exitCode === 0;
 }
 
 // ===== Section 5: Extension Version Actions =====
@@ -674,6 +679,24 @@ function run(argv) {
   var startTime = nowIso();
   var dryRun    = true; // safe default for bare local invocation
   var envelope;
+
+  // Declared here (rather than with their first `var` inside the try
+  // block below) so that if an exception fires partway through, the
+  // catch block below can still report whatever of these WAS figured
+  // out before the failure - a caller working from a failure envelope
+  // alone (e.g. for triage without diag-file access) shouldn't have to
+  // special-case its shape vs. a success envelope's. `var` redeclaration
+  // inside the try block further down is legal JS and just reassigns
+  // these same function-scoped bindings, it does not shadow them.
+  var extId = null;
+  var targetVersion = null;
+  var extensionPath = null;
+  var targetUser = { user: null, uid: null, resolution_note: null };
+  var osMajor = null;
+  var decision = { action: null, installedVersion: null };
+  var action = null;
+  var installedVersionAfter = null;
+  var vscodeRestarted = false;
 
   // Deliberately placed before any real work at all - see restartVSCodeIfRunning's
   // own comment on why this tracing is kept permanently rather than
@@ -803,15 +826,32 @@ function run(argv) {
     var msg  = (e && e.message) ? e.message : String(e);
     writeDiag('ERROR: ' + code + ': ' + msg);
     envelope = {
-      os_family:      OS_FAMILY,
-      script_version: SCRIPT_VERSION,
-      status:         'failure',
-      changed:        false,
-      error:          { code: code, message: msg, stderr: '' },
-      dry_run:        dryRun,
-      start_time:     startTime,
-      end_time:       nowIso(),
-      metadata:       { hostname: hostname(), serial_number: '' },
+      os_family:                OS_FAMILY,
+      script_version:           SCRIPT_VERSION,
+      status:                   'failure',
+      changed:                  false,
+      error:                    { code: code, message: msg, stderr: '' },
+      dry_run:                  dryRun,
+      start_time:               startTime,
+      end_time:                 nowIso(),
+      metadata:                 { hostname: hostname(), serial_number: serialNumber() },
+      // Mirrors the success envelope's own full field list - whatever of
+      // these was already figured out before the failure (see the `var`
+      // declarations at the top of this function) is reported as-is;
+      // anything not yet reached stays at its safe default instead of
+      // just being absent from a differently-shaped object.
+      extension_id:             extId,
+      target_version:           targetVersion,
+      extension_path:           extensionPath,
+      action:                   decision.action,
+      installed_version_before: decision.installedVersion || null,
+      installed_version_after:  installedVersionAfter,
+      target_user:              targetUser.user,
+      ran_as_root:              targetUser.uid === null,
+      user_resolution_note:     targetUser.resolution_note,
+      os_major_version:         osMajor,
+      cli_result:               action,
+      vscode_restarted:         vscodeRestarted,
     };
   }
 

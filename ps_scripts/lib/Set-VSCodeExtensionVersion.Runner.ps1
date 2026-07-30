@@ -695,7 +695,21 @@ function Get-VSCodeRunningPidsForUser {
   param([string]$TargetUser)
   if (-not $TargetUser) { return @() }
   $owners = Get-VSCodeProcessOwners 'Code.exe'
-  return $owners | Where-Object { $_.User -eq $TargetUser } | ForEach-Object { $_.ProcessId }
+  # @(...) documents the intent (always a collection, never a bare pid)
+  # but does NOT by itself guarantee callers see an array - a function's
+  # `return @(...)` still gets enumerated back into individual objects on
+  # the way out through PowerShell's own pipeline/output-stream boundary,
+  # so a caller doing plain `$x = Get-VSCodeRunningPidsForUser ...` sees
+  # exactly what a bare `return $someCollection` would have given it:
+  # $null for zero matches, a scalar (no .Count) for exactly one, and
+  # only a real array for two or more. See Restart-VSCodeIfRunning's own
+  # callers, which each wrap this call in `@(...)` themselves for exactly
+  # that reason - this file's own PowerShell 7-bootstrapped test history
+  # (see Invoke-VSCodeNativeCommand's own comment) had never caught this,
+  # since PowerShell 7+ added a universal Count property to scalars that
+  # masks it entirely; real RTR runs under Windows PowerShell 5.1, where
+  # a bare scalar has no such property.
+  return @($owners | Where-Object { $_.User -eq $TargetUser } | ForEach-Object { $_.ProcessId })
 }
 
 # Derives the real GUI Code.exe from the resolved code.cmd CLI path
@@ -753,7 +767,18 @@ function Invoke-VSCodeCloseMainWindow {
 function Restart-VSCodeIfRunning {
   param([string]$TargetUser, [string]$CodePath)
   if (-not $TargetUser) { return $false }
-  $pids = Get-VSCodeRunningPidsForUser $TargetUser
+  # @(...) here at the CALL site, not just inside
+  # Get-VSCodeRunningPidsForUser's own return statement - a function's
+  # `return @(...)` does not survive the trip through PowerShell's own
+  # pipeline/output-stream boundary: the array gets enumerated back into
+  # individual objects on the way out, so the caller sees exactly what a
+  # bare `return $someCollection` would have given it - $null for zero
+  # matches, a bare scalar (no .Count) for exactly one, and only an
+  # actual array for two or more. Confirmed directly: the internal @()
+  # wrap alone was NOT enough - this line's own `.Count` access still
+  # threw PropertyNotFoundException under Set-StrictMode against a
+  # single mocked pid until this call site was wrapped too.
+  $pids = @(Get-VSCodeRunningPidsForUser $TargetUser)
   if ($pids.Count -eq 0) { return $false }
 
   # Gentlest action first, matching the mac side's own quit-AppleEvent-
@@ -766,7 +791,7 @@ function Restart-VSCodeIfRunning {
   }
 
   $waited = 0
-  while ((Get-VSCodeRunningPidsForUser $TargetUser).Count -gt 0 -and $waited -lt 10) {
+  while (@(Get-VSCodeRunningPidsForUser $TargetUser).Count -gt 0 -and $waited -lt 10) {
     Start-Sleep -Seconds 1
     $waited++
   }
@@ -778,7 +803,7 @@ function Restart-VSCodeIfRunning {
   # via real_world_check's own scenario 17 against a real RTR-shaped
   # session that this reliably falls through to here, every time, in
   # this script's actual real deployment context.
-  $stillRunning = Get-VSCodeRunningPidsForUser $TargetUser
+  $stillRunning = @(Get-VSCodeRunningPidsForUser $TargetUser)
   if ($stillRunning.Count -eq 0) {
     Write-VSCodeDiag "Restart-VSCodeIfRunning: graceful close succeeded within ${waited}s, no force-kill needed"
   } else {
@@ -790,17 +815,19 @@ function Restart-VSCodeIfRunning {
 
   $guiExePath = Get-VSCodeGuiExePath $CodePath
   $taskName = "GlowVSCodeRestart_$([Guid]::NewGuid().ToString('N'))"
+  $relaunched = $false
   try {
     $action = New-ScheduledTaskAction -Execute $guiExePath
     $principal = New-ScheduledTaskPrincipal -UserId $TargetUser -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force -ErrorAction Stop | Out-Null
     Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+    $relaunched = $true
   } catch {
     Write-VSCodeDiag "WARN: failed to relaunch VS Code for ${TargetUser}: $_"
   } finally {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
   }
-  return $true
+  return $relaunched
 }
 
 function Get-VSCodeInstalledExtensionsRaw {
@@ -909,19 +936,72 @@ function ConvertTo-VSCodeErrorJson {
   }
 }
 
+# A real (non-sentinel) $TargetUser from Resolve-VSCodeTargetUser has
+# ResolutionNote = $null in exactly one case: a real user was actually
+# resolved, in which case User is always non-null too. Every fallback
+# path sets ResolutionNote, regardless of whether User also happens to
+# be kept around for diagnostics (e.g. EXTENSION_PATH_USER_NOT_FOUND).
+# That leaves (User=$null, ResolutionNote=$null) as a combination a real
+# call never produces - which is exactly the "not yet even attempted"
+# sentinel default used before Resolve-VSCodeTargetUser has run (see the
+# early failure-envelope call sites in Invoke-SetVSCodeExtensionVersion).
+# Treating that combination as a fallback (like every other unresolved
+# case) - rather than as a false "no fallback, real user resolved" -
+# matches this codebase's own "assume the more restrictive/isolated
+# case when unsure" default philosophy (same reasoning as $dryRun's own
+# safe default of $true).
+function Test-VSCodeUsedSystemFallback {
+  param([PSCustomObject]$TargetUser)
+  return -not (($null -ne $TargetUser.User) -and ($null -eq $TargetUser.ResolutionNote))
+}
+
 function New-VSCodeFailureEnvelope {
-  param([string]$StartTime, [bool]$DryRun, [string]$Code, [string]$Message)
+  param(
+    [string]$StartTime,
+    [bool]$DryRun,
+    [string]$Code,
+    [string]$Message,
+    # Mirrors the success envelope's own full field list - whatever of
+    # these the caller had already figured out before the failure is
+    # passed through as-is; anything not yet reached is left at these
+    # "not yet known" defaults instead of just being absent from a
+    # differently-shaped object. See Invoke-SetVSCodeExtensionVersion's
+    # own default-initialized variables at the top of its try block,
+    # which is what makes "whatever was already figured out" available
+    # at every one of this function's call sites, early or late.
+    [string]$ExtId = $null,
+    [string]$TargetVersion = $null,
+    [string]$ExtensionPath = $null,
+    [PSCustomObject]$TargetUser = [PSCustomObject]@{ User = $null; ExtensionsDir = $null; ResolutionNote = $null },
+    $OsMajor = $null,
+    [PSCustomObject]$Decision = [PSCustomObject]@{ Action = $null; InstalledVersion = $null },
+    $Action = $null,
+    [string]$InstalledVersionAfter = $null,
+    [bool]$VscodeRestarted = $false
+  )
   Write-VSCodeDiag "ERROR: ${Code}: $Message"
   $envelope = [PSCustomObject]@{
-    os_family      = $Script:OsFamily
-    script_version = $Script:ScriptVersion
-    status         = 'failure'
-    changed        = $false
-    error          = [PSCustomObject]@{ code = $Code; message = $Message; stderr = '' }
-    dry_run        = $DryRun
-    start_time     = $StartTime
-    end_time       = (Get-VSCodeNowIso)
-    metadata       = [PSCustomObject]@{ hostname = $env:COMPUTERNAME; serial_number = '' }
+    os_family                = $Script:OsFamily
+    script_version           = $Script:ScriptVersion
+    status                   = 'failure'
+    changed                  = $false
+    error                    = [PSCustomObject]@{ code = $Code; message = $Message; stderr = '' }
+    dry_run                  = $DryRun
+    start_time                = $StartTime
+    end_time                  = (Get-VSCodeNowIso)
+    metadata                  = [PSCustomObject]@{ hostname = $env:COMPUTERNAME; serial_number = (Get-VSCodeSerialNumber) }
+    extension_id               = $ExtId
+    target_version             = $TargetVersion
+    extension_path             = $ExtensionPath
+    action                     = $Decision.Action
+    installed_version_before   = $Decision.InstalledVersion
+    installed_version_after    = $InstalledVersionAfter
+    target_user                = $TargetUser.User
+    used_system_fallback       = (Test-VSCodeUsedSystemFallback $TargetUser)
+    user_resolution_note       = $TargetUser.ResolutionNote
+    os_major_version           = $OsMajor
+    cli_result                 = (ConvertTo-VSCodeCliResultJson $Action)
+    vscode_restarted            = $VscodeRestarted
   }
   return ($envelope | ConvertTo-Json -Compress -Depth 6)
 }
@@ -931,6 +1011,22 @@ function Invoke-SetVSCodeExtensionVersion {
 
   $startTime = Get-VSCodeNowIso
   $dryRun = $true # safe default for bare local invocation
+
+  # Initialized here (rather than at their first assignment inside the
+  # try block below) so that if an exception escapes all the way to the
+  # outer catch, that catch can still report whatever of these WAS
+  # figured out before the failure - reassigning a variable already
+  # declared in this scope, as the try block below does, does not
+  # shadow it. See New-VSCodeFailureEnvelope's own comment.
+  $extId = $null
+  $targetVersion = $null
+  $extensionPath = $null
+  $targetUser = [PSCustomObject]@{ User = $null; ExtensionsDir = $null; ResolutionNote = $null }
+  $osMajor = $null
+  $decision = [PSCustomObject]@{ Action = $null; InstalledVersion = $null }
+  $action = $null
+  $installedVersionAfter = $null
+  $vscodeRestarted = $false
 
   try {
     $inputObj = $null
@@ -945,13 +1041,13 @@ function Invoke-SetVSCodeExtensionVersion {
     $extId = Get-VSCodeProp $params 'extension_id' $null
     $extId = if ($null -eq $extId) { '' } else { [string]$extId }
     if (-not (Test-VSCodeExtensionId $extId)) {
-      return New-VSCodeFailureEnvelope $startTime $dryRun 'INVALID_PARAMS' 'invalid or missing extension_id (expected "<publisher>.<name>")'
+      return New-VSCodeFailureEnvelope $startTime $dryRun 'INVALID_PARAMS' 'invalid or missing extension_id (expected "<publisher>.<name>")' -ExtId $extId
     }
 
     $targetVersion = Get-VSCodeProp $params 'version' $null
     if ($null -ne $targetVersion) { $targetVersion = [string]$targetVersion }
     if (-not (Test-VSCodeExtensionVersion $targetVersion)) {
-      return New-VSCodeFailureEnvelope $startTime $dryRun 'INVALID_PARAMS' "invalid version: $targetVersion"
+      return New-VSCodeFailureEnvelope $startTime $dryRun 'INVALID_PARAMS' "invalid version: $targetVersion" -ExtId $extId -TargetVersion $targetVersion
     }
 
     $extensionPath = Get-VSCodeProp $params 'extension_path' $null
@@ -959,7 +1055,8 @@ function Invoke-SetVSCodeExtensionVersion {
 
     $codePath = Find-VSCodeCli -TargetUser $targetUser.User
     if (-not $codePath) {
-      return New-VSCodeFailureEnvelope $startTime $dryRun 'VSCODE_NOT_INSTALLED' 'code.cmd was not found in any known install location'
+      return New-VSCodeFailureEnvelope $startTime $dryRun 'VSCODE_NOT_INSTALLED' 'code.cmd was not found in any known install location' `
+        -ExtId $extId -TargetVersion $targetVersion -ExtensionPath $extensionPath -TargetUser $targetUser
     }
 
     $osMajor = Get-VSCodeOSMajorVersion
@@ -967,7 +1064,8 @@ function Invoke-SetVSCodeExtensionVersion {
     $listResult = Get-VSCodeInstalledExtensionsRaw $codePath $targetUser.ExtensionsDir
     if ($listResult.ExitCode -ne 0) {
       $rawMsg = if ($listResult.Stderr) { $listResult.Stderr } elseif ($listResult.Stdout) { $listResult.Stdout } else { '' }
-      return New-VSCodeFailureEnvelope $startTime $dryRun 'LIST_EXTENSIONS_FAILED' "code --list-extensions failed: $($rawMsg.Trim())"
+      return New-VSCodeFailureEnvelope $startTime $dryRun 'LIST_EXTENSIONS_FAILED' "code --list-extensions failed: $($rawMsg.Trim())" `
+        -ExtId $extId -TargetVersion $targetVersion -ExtensionPath $extensionPath -TargetUser $targetUser -OsMajor $osMajor
     }
     $installedBefore = ConvertFrom-VSCodeInstalledExtensionsList $listResult.Stdout
     $decision = Get-VSCodeVersionAction $installedBefore $extId $targetVersion
@@ -1022,7 +1120,13 @@ function Invoke-SetVSCodeExtensionVersion {
       installed_version_before   = $decision.InstalledVersion
       installed_version_after    = $installedVersionAfter
       target_user                = $targetUser.User
-      ran_as_root                = ($null -ne $targetUser.ResolutionNote)
+      # Named distinctly from the macOS side's own `ran_as_root` field -
+      # Windows always runs under SYSTEM here (RTR has no equivalent of
+      # mac's `launchctl asuser` impersonation), so "ran as root" was
+      # never actually true; this is really "user resolution failed and
+      # we fell back to SYSTEM's own isolated extensions dir instead of
+      # a resolved user's profile" (see Resolve-VSCodeTargetUser).
+      used_system_fallback       = (Test-VSCodeUsedSystemFallback $targetUser)
       user_resolution_note       = $targetUser.ResolutionNote
       os_major_version           = $osMajor
       cli_result                 = (ConvertTo-VSCodeCliResultJson $action)
@@ -1033,7 +1137,10 @@ function Invoke-SetVSCodeExtensionVersion {
     Write-VSCodeDiag "RESULT: $json"
     return $json
   } catch {
-    return New-VSCodeFailureEnvelope $startTime $dryRun 'UNHANDLED_ERROR' $_.Exception.Message
+    return New-VSCodeFailureEnvelope $startTime $dryRun 'UNHANDLED_ERROR' $_.Exception.Message `
+      -ExtId $extId -TargetVersion $targetVersion -ExtensionPath $extensionPath -TargetUser $targetUser `
+      -OsMajor $osMajor -Decision $decision -Action $action -InstalledVersionAfter $installedVersionAfter `
+      -VscodeRestarted $vscodeRestarted
   }
 }
 

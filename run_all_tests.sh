@@ -30,7 +30,7 @@
 # different code path (real put-file upload, a real session against a
 # real sensor-enrolled device), not a re-run of the same thing: this is
 # what actually surfaced two real macOS bugs neither direct invocation
-# nor the mocked suites ever could (see dist/README.md's "Bugs found").
+# nor the mocked suites ever could (see dist/mac/README.md's "Build log").
 # Opt-in and additive, not a replacement - the direct-invocation stages
 # still run every time, --rtr or not. Per selected target: if --rtr is
 # passed but that target has no DEVICE_AID configured, its -rtr stage is

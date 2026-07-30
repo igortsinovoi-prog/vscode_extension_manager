@@ -185,6 +185,30 @@ Context 'Resolve-VSCodeTargetUser' {
   }
 }
 
+Context 'Test-VSCodeUsedSystemFallback' {
+  It 'a real resolved user with no resolution note -> false (not a fallback)' {
+    Test-VSCodeUsedSystemFallback ([PSCustomObject]@{ User = 'jdoe'; ResolutionNote = $null }) | Should -BeFalse
+  }
+
+  It 'a resolution note set, user still kept for diagnostics (e.g. not-found) -> true' {
+    Test-VSCodeUsedSystemFallback ([PSCustomObject]@{ User = 'glow_test_no_such_user'; ResolutionNote = 'EXTENSION_PATH_USER_NOT_FOUND' }) | Should -BeTrue
+  }
+
+  It 'a resolution note set, no user at all (e.g. missing/invalid path) -> true' {
+    Test-VSCodeUsedSystemFallback ([PSCustomObject]@{ User = $null; ResolutionNote = 'MISSING_EXTENSION_PATH' }) | Should -BeTrue
+  }
+
+  It 'neither user nor resolution note set (Resolve-VSCodeTargetUser never even ran) -> true, not a false "real user resolved"' {
+    # A real call to Resolve-VSCodeTargetUser never produces this
+    # combination - it's the sentinel default used by early failure
+    # envelopes (INVALID_PARAMS on extension_id/version) built before
+    # target-user resolution has run at all. Must not be confused with
+    # the one real case that also has ResolutionNote = $null: an
+    # actually-resolved real user.
+    Test-VSCodeUsedSystemFallback ([PSCustomObject]@{ User = $null; ResolutionNote = $null }) | Should -BeTrue
+  }
+}
+
 Context 'Get-VSCodeUserDataDir' {
   It 'derives AppData\Roaming\Code from the profile root above \.vscode\extensions' {
     Get-VSCodeUserDataDir 'C:\Users\jdoe\.vscode\extensions' | Should -Be 'C:\Users\jdoe\AppData\Roaming\Code'
@@ -384,6 +408,26 @@ Context 'Get-VSCodeRunningPidsForUser / Restart-VSCodeIfRunning' {
     $script:StopProcessLog | Should -Be @(4242)
     ($script:ScheduledTaskLog | Select-Object -ExpandProperty Event) | Should -Be @('register', 'start', 'unregister')
   }
+
+  It 'relaunch scheduled task genuinely fails to start -> returns $false, not just $true because processes were found and killed' {
+    $script:MockConfig.RunningPids = @(4242)
+    # Register succeeds (still logged/unregistered), but the actual
+    # Start-ScheduledTask call throws - e.g. the task's principal/logon
+    # type is rejected, or the target user has no interactive session.
+    # vscode_restarted must reflect that real failure, not just "VS Code
+    # was found running and we attempted something".
+    Mock Start-ScheduledTask {
+      param($TaskName)
+      throw 'Start-ScheduledTask: The task launch failed.'
+    }
+    $result = Restart-VSCodeIfRunning 'jdoe' 'C:\Program Files\Microsoft VS Code\bin\code.cmd'
+    $result | Should -BeFalse
+    # The graceful-close-then-relaunch attempt still happened...
+    $script:GracefulCloseLog | Should -Be @(4242)
+    # ...register was attempted and unregister still ran (cleanup via
+    # `finally`), but there's no 'start' entry since it threw.
+    ($script:ScheduledTaskLog | Select-Object -ExpandProperty Event) | Should -Be @('register', 'unregister')
+  }
 }
 
 Context 'Invoke-SetVSCodeExtensionVersion end-to-end' {
@@ -391,12 +435,28 @@ Context 'Invoke-SetVSCodeExtensionVersion end-to-end' {
     $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'not-an-id' } $true) | ConvertFrom-Json
     $result.status | Should -Be 'failure'
     $result.error.code | Should -Be 'INVALID_PARAMS'
+    # Failure envelopes mirror the success envelope's own full field list -
+    # whatever was already figured out before the failure (here, just the
+    # raw invalid extension_id itself) is reported as-is; everything not
+    # yet reached stays at its safe "not yet known" default rather than
+    # just being absent, so a caller never has to special-case a failure
+    # envelope's shape vs. a success one's.
+    $result.extension_id | Should -Be 'not-an-id'
+    $result.target_version | Should -BeNullOrEmpty
+    $result.extension_path | Should -BeNullOrEmpty
+    $result.action | Should -BeNullOrEmpty
+    $result.target_user | Should -BeNullOrEmpty
+    $result.used_system_fallback | Should -BeTrue
+    $result.cli_result | Should -BeNullOrEmpty
+    $result.vscode_restarted | Should -BeFalse
   }
 
   It 'invalid version -> failure envelope, INVALID_PARAMS' {
     $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = 'not-semver' } $true) | ConvertFrom-Json
     $result.status | Should -Be 'failure'
     $result.error.code | Should -Be 'INVALID_PARAMS'
+    $result.extension_id | Should -Be 'ms-python.python'
+    $result.target_version | Should -Be 'not-semver'
   }
 
   It 'code.cmd not found anywhere -> failure envelope, VSCODE_NOT_INSTALLED' {
@@ -404,6 +464,11 @@ Context 'Invoke-SetVSCodeExtensionVersion end-to-end' {
     $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
     $result.status | Should -Be 'failure'
     $result.error.code | Should -Be 'VSCODE_NOT_INSTALLED'
+    # Unlike macOS (which checks VS Code's own install location before
+    # ever reading extension_path), Windows resolves the target user
+    # first - so extension_path/target_user are already known here.
+    $result.extension_path | Should -Be $script:JdoePath
+    $result.target_user | Should -Be 'jdoe'
   }
 
   It 'code --list-extensions itself fails -> failure envelope, LIST_EXTENSIONS_FAILED' {
@@ -411,6 +476,11 @@ Context 'Invoke-SetVSCodeExtensionVersion end-to-end' {
     $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.1.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
     $result.status | Should -Be 'failure'
     $result.error.code | Should -Be 'LIST_EXTENSIONS_FAILED'
+    $result.extension_id | Should -Be 'ms-python.python'
+    $result.target_version | Should -Be '2024.1.0'
+    $result.extension_path | Should -Be $script:JdoePath
+    $result.target_user | Should -Be 'jdoe'
+    $result.used_system_fallback | Should -BeFalse
   }
 
   It 'extension not installed -> skipped, no CLI action taken' {
@@ -504,12 +574,12 @@ Context 'Invoke-SetVSCodeExtensionVersion end-to-end' {
     $result.changed | Should -BeFalse
   }
 
-  It 'extension_path names a user with no profile directory -> still proceeds, ran_as_root true' {
+  It 'extension_path names a user with no profile directory -> still proceeds, used_system_fallback true' {
     Mock Test-VSCodePathAccess { [PSCustomObject]@{ Exists = $false; AccessDenied = $false } }
     $script:MockConfig.ListExtensionsStdout = "ms-python.python@2024.1.0`n"
     $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.1.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
     $result.target_user | Should -Be 'jdoe'
-    $result.ran_as_root | Should -BeTrue
+    $result.used_system_fallback | Should -BeTrue
     $result.user_resolution_note | Should -Be 'EXTENSION_PATH_USER_NOT_FOUND'
     # And the CLI was pointed at SYSTEM's own extensions dir, not a real user's.
     $listCall = $script:CommandLog | Where-Object { $_.ArgumentList -contains '--list-extensions' } | Select-Object -First 1
@@ -520,7 +590,7 @@ Context 'Invoke-SetVSCodeExtensionVersion end-to-end' {
     $script:MockConfig.ListExtensionsStdout = "ms-python.python@2024.1.0`n"
     $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.1.0' } $true) | ConvertFrom-Json
     $result.target_user | Should -BeNullOrEmpty
-    $result.ran_as_root | Should -BeTrue
+    $result.used_system_fallback | Should -BeTrue
     $result.status | Should -Be 'skipped' # already at 2024.1.0
   }
 }
