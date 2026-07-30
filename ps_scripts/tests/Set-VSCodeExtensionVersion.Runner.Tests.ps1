@@ -179,21 +179,35 @@ Context 'Enable-VSCodeSignatureVerificationBypass / Restore-VSCodeSignatureVerif
     Should -Invoke Set-VSCodeFileContent -Times 1 -ParameterFilter { $Content -match '"extensions.verifySignature":\s*false' }
 
     Restore-VSCodeSignatureVerification $state
-    Should -Invoke Remove-VSCodeFileIfExists -Times 1
+    # Not-existed case: no backup was ever created, so this is just the
+    # removal of the (never-created) settings.json plus the unconditional
+    # backup-path cleanup that always runs regardless of FileExisted.
+    Should -Invoke Remove-VSCodeFileIfExists -Times 2
   }
 
-  It 'preserves other keys and restores the exact original raw text when settings.json already existed' {
+  It 'preserves other keys and restores the exact original raw text (from a real on-disk backup, not memory) when settings.json already existed' {
     $originalRaw = '{"editor.fontSize": 14}'
     Mock Get-VSCodeFileContent { $originalRaw }
     $state = Enable-VSCodeSignatureVerificationBypass 'C:\Users\jdoe\AppData\Roaming\Code'
     $state.FileExisted | Should -BeTrue
-    $state.OriginalRaw | Should -Be $originalRaw
+    # OriginalRaw is deliberately NOT kept on the state object anymore -
+    # Restore-VSCodeSignatureVerification reads it back from the on-disk
+    # backup instead (State.BackupPath), not from memory - see that
+    # function's own comment on why that matters.
+    $state.BackupPath | Should -Be 'C:\Users\jdoe\AppData\Roaming\Code\User\settings.json.rwcbak'
+    # Two calls so far: the real on-disk backup (exact original raw text)
+    # and the bypassed settings.json.
+    Should -Invoke Set-VSCodeFileContent -Times 1 -ParameterFilter { $Path -eq $state.BackupPath -and $Content -eq $originalRaw }
     Should -Invoke Set-VSCodeFileContent -Times 1 -ParameterFilter {
       $Content -match '"editor.fontSize":\s*14' -and $Content -match '"extensions.verifySignature":\s*false'
     }
 
     Restore-VSCodeSignatureVerification $state
-    Should -Invoke Set-VSCodeFileContent -Times 1 -ParameterFilter { $Content -eq $originalRaw }
+    # Now three total: the two above, plus the restore write - the
+    # backup and the restore both legitimately have the same content
+    # (the exact original raw text), so two calls now match that filter.
+    Should -Invoke Set-VSCodeFileContent -Times 2 -ParameterFilter { $Content -eq $originalRaw }
+    Should -Invoke Remove-VSCodeFileIfExists -Times 1 -ParameterFilter { $Path -eq $state.BackupPath }
   }
 
   It 'skips applying (and does not touch the file) if existing settings.json fails to parse' {
@@ -221,10 +235,12 @@ Context 'Invoke-VSCodeCli dispatch' {
     Mock Get-VSCodeFileContent { '{"foo":"bar"}' }
     Invoke-VSCodeCli -CodePath 'C:\code.cmd' -ExtensionsDir 'C:\Users\jdoe\.vscode\extensions' `
       -Arguments @('--list-extensions') -TimeoutSec 20
-    # One Set-VSCodeFileContent call to apply the bypass, one to restore -
-    # the second must be the original raw text, not the bypassed version.
-    Should -Invoke Set-VSCodeFileContent -Times 2
-    Should -Invoke Set-VSCodeFileContent -Times 1 -ParameterFilter { $Content -eq '{"foo":"bar"}' }
+    # Three Set-VSCodeFileContent calls: the real on-disk backup, the
+    # bypass, and the restore - the backup and the restore both
+    # legitimately carry the original raw text, so two calls match that
+    # content, not one.
+    Should -Invoke Set-VSCodeFileContent -Times 3
+    Should -Invoke Set-VSCodeFileContent -Times 2 -ParameterFilter { $Content -eq '{"foo":"bar"}' }
   }
 }
 

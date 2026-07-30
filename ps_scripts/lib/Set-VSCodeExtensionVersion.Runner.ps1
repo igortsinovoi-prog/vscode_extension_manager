@@ -155,7 +155,21 @@ function Get-VSCodeFileContent {
 
 function Set-VSCodeFileContent {
   param([string]$Path, [string]$Content)
-  Set-Content -LiteralPath $Path -Value $Content -Encoding utf8
+  # Atomic write: write to a temp file in the SAME directory (same
+  # volume, so the final move is a single filesystem rename, not a
+  # copy+delete that could be interrupted partway) then move it over the
+  # real path - a process killed mid-write (RTR's own script-execution
+  # timeout, session termination, ...) can otherwise leave settings.json
+  # truncated/corrupted (a half-written file) instead of either its old
+  # or new content intact.
+  $dir = Split-Path -Path $Path -Parent
+  $tempPath = Join-Path $dir ([System.IO.Path]::GetRandomFileName())
+  try {
+    Set-Content -LiteralPath $tempPath -Value $Content -Encoding utf8
+    Move-Item -LiteralPath $tempPath -Destination $Path -Force
+  } finally {
+    Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+  }
 }
 
 function Remove-VSCodeFileIfExists {
@@ -463,6 +477,7 @@ function Enable-VSCodeSignatureVerificationBypass {
   param([string]$UserDataDir)
   $settingsDir = Join-Path $UserDataDir 'User'
   $settingsPath = Join-Path $settingsDir 'settings.json'
+  $backupPath = "$settingsPath.rwcbak"
   $fileExisted = Test-VSCodeFileExists $settingsPath
   $originalRaw = if ($fileExisted) { Get-VSCodeFileContent $settingsPath } else { $null }
 
@@ -482,14 +497,27 @@ function Enable-VSCodeSignatureVerificationBypass {
       return [PSCustomObject]@{ Applied = $false }
     }
   }
+
+  # A REAL on-disk backup, not just $originalRaw held in this process'
+  # own memory - if this process is killed before
+  # Restore-VSCodeSignatureVerification ever runs (RTR's own script-
+  # execution timeout, session termination, ...), the original content
+  # used to be gone for good, leaving verifySignature stuck false with
+  # no recovery path. Only written when there's real original content to
+  # protect; Set-VSCodeFileContent's own atomic write means this can't
+  # itself leave a half-written backup either.
+  if ($fileExisted) {
+    Set-VSCodeFileContent $backupPath $originalRaw
+  }
+
   $settings['extensions.verifySignature'] = $false
   Set-VSCodeFileContent $settingsPath ($settings | ConvertTo-Json -Depth 10)
 
   return [PSCustomObject]@{
     Applied      = $true
     SettingsPath = $settingsPath
+    BackupPath   = $backupPath
     FileExisted  = $fileExisted
-    OriginalRaw  = $originalRaw
   }
 }
 
@@ -498,12 +526,17 @@ function Restore-VSCodeSignatureVerification {
   if (-not $State -or -not $State.Applied) { return }
   try {
     if ($State.FileExisted) {
-      Set-VSCodeFileContent $State.SettingsPath $State.OriginalRaw
+      # From the on-disk backup, not an in-memory variable - see
+      # Enable-VSCodeSignatureVerificationBypass's own comment on why
+      # that matters.
+      $originalRaw = Get-VSCodeFileContent $State.BackupPath
+      Set-VSCodeFileContent $State.SettingsPath $originalRaw
     } else {
       Remove-VSCodeFileIfExists $State.SettingsPath
     }
+    Remove-VSCodeFileIfExists $State.BackupPath
   } catch {
-    Write-VSCodeDiag "WARN: could not restore settings.json at $($State.SettingsPath): $_"
+    Write-VSCodeDiag "WARN: could not restore settings.json at $($State.SettingsPath) from backup $($State.BackupPath): $_"
   }
 }
 

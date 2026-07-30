@@ -338,12 +338,17 @@ test('runCode: brackets the call with the signature-verification bypass, enablin
   mockConfig.settingsFileExists = true;
   mockConfig.settingsRaw = '{"foo":"bar"}';
   runCode(501, 'jdoe', ['--list-extensions']);
-  // One write to apply the bypass, one to restore - the restore must be
-  // the exact original raw text, not the bypassed version.
-  assertEqual(fileWriteLog.length, 2);
-  assertEqual(fileWriteLog[0].path, '/Users/jdoe/Library/Application Support/Code/User/settings.json');
-  assertTrue(JSON.parse(fileWriteLog[0].content)['extensions.verifySignature'] === false);
-  assertEqual(fileWriteLog[1].content, '{"foo":"bar"}');
+  // Four writes: a real on-disk backup of the original content, the
+  // bypassed settings.json, the restore (read back from that backup,
+  // not from an in-memory variable), then the backup itself cleaned up.
+  assertEqual(fileWriteLog.length, 4);
+  assertEqual(fileWriteLog[0].path, '/Users/jdoe/Library/Application Support/Code/User/settings.json.rwcbak');
+  assertEqual(fileWriteLog[0].content, '{"foo":"bar"}');
+  assertEqual(fileWriteLog[1].path, '/Users/jdoe/Library/Application Support/Code/User/settings.json');
+  assertTrue(JSON.parse(fileWriteLog[1].content)['extensions.verifySignature'] === false);
+  assertEqual(fileWriteLog[2].content, '{"foo":"bar"}');
+  assertEqual(fileWriteLog[3].path, '/Users/jdoe/Library/Application Support/Code/User/settings.json.rwcbak');
+  assertEqual(fileWriteLog[3].content, null);
 });
 
 test('runCode: uses root\'s own settings.json when uid is null, never a real user\'s', function () {
@@ -372,8 +377,12 @@ test('enableSignatureBypass: no existing settings.json -> creates one with verif
   assertEqual(JSON.parse(fileWriteLog[0].content)['extensions.verifySignature'], false);
 
   restoreSignatureVerification(state);
-  assertEqual(fileWriteLog.length, 2);
-  assertEqual(fileWriteLog[1].content, null); // removeFile logs content: null
+  // Not-existed case: no backup was ever created, so only the removal of
+  // the (never-created) settings.json plus the unconditional backup-path
+  // cleanup that always runs regardless of fileExisted.
+  assertEqual(fileWriteLog.length, 3);
+  assertEqual(fileWriteLog[1].content, null); // removeFile(settingsPath) logs content: null
+  assertEqual(fileWriteLog[2].content, null); // removeFile(backupPath) logs content: null
 });
 
 test('enableSignatureBypass: existing settings.json -> preserves other keys, restore writes back the exact original raw text', function () {
@@ -382,13 +391,21 @@ test('enableSignatureBypass: existing settings.json -> preserves other keys, res
   var path = '/Users/jdoe/Library/Application Support/Code/User/settings.json';
   var state = enableSignatureBypass(path);
   assertEqual(state.fileExisted, true);
-  assertEqual(state.originalRaw, '{"editor.fontSize":14}');
-  var written = JSON.parse(fileWriteLog[0].content);
+  // originalRaw is deliberately NOT kept on the state object anymore -
+  // restoreSignatureVerification reads it back from the on-disk backup
+  // instead (state.backupPath), not from memory - see that function's
+  // own comment on why that matters.
+  assertEqual(state.backupPath, path + '.rwcbak');
+  assertEqual(fileWriteLog[0].path, path + '.rwcbak');
+  assertEqual(fileWriteLog[0].content, '{"editor.fontSize":14}');
+  var written = JSON.parse(fileWriteLog[1].content);
   assertEqual(written['editor.fontSize'], 14);
   assertEqual(written['extensions.verifySignature'], false);
 
   restoreSignatureVerification(state);
-  assertEqual(fileWriteLog[1].content, '{"editor.fontSize":14}');
+  assertEqual(fileWriteLog[2].content, '{"editor.fontSize":14}');
+  assertEqual(fileWriteLog[3].path, path + '.rwcbak');
+  assertEqual(fileWriteLog[3].content, null);
 });
 
 test('enableSignatureBypass: unparseable existing settings.json -> does not apply, does not touch the file', function () {

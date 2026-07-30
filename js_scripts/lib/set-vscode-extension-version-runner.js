@@ -386,7 +386,12 @@ function getSettingsPath(uid, user) {
 function enableSignatureBypass(settingsPath, uid) {
   var fileExisted = fileExists(settingsPath);
   var originalRaw = fileExisted ? readFileRaw(settingsPath) : null;
+  var backupPath = settingsPath + '.rwcbak';
 
+  // Parse BEFORE writing anything - an unparseable existing file must
+  // leave the real filesystem completely untouched (not even a backup
+  // created), matching this function's own "leaving it untouched"
+  // promise below.
   var settings = {};
   if (originalRaw && originalRaw.trim()) {
     try {
@@ -396,22 +401,42 @@ function enableSignatureBypass(settingsPath, uid) {
       return { applied: false };
     }
   }
+
+  // A REAL on-disk backup, not just originalRaw held in this process'
+  // own memory - if this process is killed before
+  // restoreSignatureVerification ever runs (RTR's own script-execution
+  // timeout, session termination, ...), the original content used to be
+  // gone for good, leaving verifySignature stuck false with no recovery
+  // path. writeFileRaw's own atomic write (writeToFileAtomicallyEncodingError)
+  // means this can't itself leave a half-written backup either. Only
+  // written when there's real original content to protect - the
+  // not-existed case has nothing to back up, and restoreSignatureVerification's
+  // own unconditional cleanup below handles clearing the backup path
+  // either way once this run's own restore actually happens.
+  if (fileExisted) {
+    writeFileRaw(backupPath, originalRaw, uid);
+  }
+
   settings['extensions.verifySignature'] = false;
   writeFileRaw(settingsPath, JSON.stringify(settings), uid);
 
-  return { applied: true, settingsPath: settingsPath, fileExisted: fileExisted, originalRaw: originalRaw, uid: uid };
+  return { applied: true, settingsPath: settingsPath, backupPath: backupPath, fileExisted: fileExisted, uid: uid };
 }
 
 function restoreSignatureVerification(state) {
   if (!state || !state.applied) return;
   try {
     if (state.fileExisted) {
-      writeFileRaw(state.settingsPath, state.originalRaw, state.uid);
+      // From the on-disk backup, not an in-memory variable - see
+      // enableSignatureBypass's own comment on why that matters.
+      var originalRaw = readFileRaw(state.backupPath);
+      writeFileRaw(state.settingsPath, originalRaw, state.uid);
     } else {
       removeFile(state.settingsPath);
     }
+    removeFile(state.backupPath);
   } catch (e) {
-    writeDiag('WARN: could not restore settings.json at ' + state.settingsPath + ': ' + e);
+    writeDiag('WARN: could not restore settings.json at ' + state.settingsPath + ' from backup ' + state.backupPath + ': ' + e);
   }
 }
 

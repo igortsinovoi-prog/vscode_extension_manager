@@ -643,6 +643,13 @@ case "$PLATFORM" in
     get_settings_backup() {
       run_as_real_user cat "$SETTINGS_PATH" 2>/dev/null || true
     }
+    # Scenario 16's own check that the deployed script's real on-disk
+    # backup (settings.json.rwcbak - see enableSignatureBypass's own
+    # comment) never lingers after a normal run - it should only ever
+    # exist transiently, for the duration of a single CLI call.
+    settings_backup_file_exists() {
+      run_as_real_user test -f "${SETTINGS_PATH}.rwcbak"
+    }
     set_verify_signature_true() {
       run_as_real_user python3 -c '
 import json, sys
@@ -1135,6 +1142,19 @@ PS
 $settingsPath = "$env:APPDATA\Code\User\settings.json"
 if (Test-Path $settingsPath) { Get-Content $settingsPath -Raw } else { "" }
 PS
+    }
+    # Scenario 16's own check that the deployed script's real on-disk
+    # backup (settings.json.rwcbak - see
+    # Enable-VSCodeSignatureVerificationBypass's own comment) never
+    # lingers after a normal run - it should only ever exist transiently,
+    # for the duration of a single CLI call.
+    settings_backup_file_exists() {
+      local result
+      result="$(remote_ps <<'PS' | tr -d '\r'
+Test-Path "$env:APPDATA\Code\User\settings.json.rwcbak"
+PS
+      )"
+      [[ "$result" == "True" ]]
     }
     # Uses .PSObject.Properties enumeration rather than ConvertFrom-Json
     # -AsHashtable - a leftover from when remote_ps ran everything through
@@ -2191,6 +2211,8 @@ echo "  envelope: $result"
 check "our script succeeds despite verification being explicitly on" "$(field "$result" status)" "success"
 check "envelope reports installed_version_after == $SIGNATURE_TEST_VERSION" "$(field "$result" installed_version_after)" "$SIGNATURE_TEST_VERSION"
 check "code --list-extensions independently confirms version $SIGNATURE_TEST_VERSION" "$(get_installed_version)" "$SIGNATURE_TEST_VERSION"
+check "deployed script's own on-disk settings.json backup does not linger after a normal run" \
+  "$(settings_backup_file_exists && echo present || echo absent)" "absent"
 
 restore_settings_backup "$SETTINGS_BACKUP_VALUE"
 SETTINGS_BACKUP_CAPTURED=false
