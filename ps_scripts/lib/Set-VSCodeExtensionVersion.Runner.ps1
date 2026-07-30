@@ -140,6 +140,49 @@ function Test-VSCodeDirectoryExists {
   return Test-Path -LiteralPath $Path -PathType Container
 }
 
+# Test-Path's own bare boolean conflates "doesn't exist" with "access
+# denied" (returns $false for both), which matters specifically for
+# target-user resolution below: under real RTR (SYSTEM), a profile
+# directory that genuinely exists but can't actually be used (unusual
+# NTFS permissions, a locked-down profile, a network-redirected profile
+# that's temporarily unreachable, ...) must never be silently reported
+# the same way as "this account has no profile at all" - the first is a
+# real access problem worth surfacing distinctly in the envelope; the
+# second is this function's own normal, expected fallback case.
+#
+# A real write-and-delete probe, not Get-Item/Get-ChildItem - confirmed
+# via a real "deny everyone full control" ACE on real hardware: neither
+# reliably throws for an Administrator-group account (read/list-style
+# checks apparently don't hit the same access check this actually cares
+# about), while the REAL failure this exists to catch - a real write,
+# deep inside enableSignatureBypass - unquestionably does. This probes
+# the one thing that actually matters: can this identity really create/
+# write something here, which is exactly what every real caller needs
+# this profile directory for.
+function Test-VSCodePathAccess {
+  param([string]$Path)
+  try {
+    if (-not (Test-Path -LiteralPath $Path)) {
+      return [PSCustomObject]@{ Exists = $false; AccessDenied = $false }
+    }
+    $probePath = Join-Path $Path ('.rwc_access_check_' + [System.IO.Path]::GetRandomFileName())
+    New-Item -ItemType File -Path $probePath -ErrorAction Stop | Out-Null
+    Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+    return [PSCustomObject]@{ Exists = $true; AccessDenied = $false }
+  } catch [System.UnauthorizedAccessException] {
+    return [PSCustomObject]@{ Exists = $true; AccessDenied = $true }
+  } catch [System.Management.Automation.ItemNotFoundException] {
+    return [PSCustomObject]@{ Exists = $false; AccessDenied = $false }
+  } catch {
+    # Anything else unexpected (a broken reparse point, a transient I/O
+    # error, ...) - treat as "doesn't exist" for safety, matching this
+    # file's own "never aborts" philosophy elsewhere, but log it since
+    # it's still worth knowing about.
+    Write-VSCodeDiag "WARN: unexpected error checking path access for ${Path}: $_"
+    return [PSCustomObject]@{ Exists = $false; AccessDenied = $false }
+  }
+}
+
 function New-VSCodeDirectoryIfMissing {
   param([string]$Path)
   if (-not (Test-VSCodeDirectoryExists $Path)) {
@@ -421,7 +464,16 @@ function Resolve-VSCodeTargetUser {
   }
 
   $userProfileDir = Resolve-VSCodeUserProfilePath $parsed.User
-  if (-not (Test-VSCodeDirectoryExists $userProfileDir)) {
+  $profileAccess = Test-VSCodePathAccess $userProfileDir
+  if ($profileAccess.AccessDenied) {
+    # Distinct from "no such profile" below - the account genuinely has
+    # a profile here, we just couldn't read into it. Reported as its own
+    # resolution note rather than folded into EXTENSION_PATH_USER_NOT_FOUND,
+    # which would misleadingly suggest the account doesn't exist at all.
+    Write-VSCodeDiag "WARN: extension_path names user `"$($parsed.User)`" whose profile directory exists but could not be accessed (permission denied) - falling back to SYSTEM's own extensions dir"
+    return [PSCustomObject]@{ User = $parsed.User; ExtensionsDir = $Script:RootFallbackExtensionsDir; ResolutionNote = 'EXTENSION_PATH_USER_PROFILE_ACCESS_DENIED' }
+  }
+  if (-not $profileAccess.Exists) {
     Write-VSCodeDiag "WARN: extension_path names user `"$($parsed.User)`" but no such profile directory exists - falling back to SYSTEM's own extensions dir"
     return [PSCustomObject]@{ User = $parsed.User; ExtensionsDir = $Script:RootFallbackExtensionsDir; ResolutionNote = 'EXTENSION_PATH_USER_NOT_FOUND' }
   }

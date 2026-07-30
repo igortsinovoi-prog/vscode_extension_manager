@@ -55,6 +55,7 @@ Describe 'Set-VSCodeExtensionVersion.Runner' {
     # real Win32_UserProfile lookup (and its fallback) is covered by its
     # own dedicated tests below, not re-verified by every other test here.
     Mock Resolve-VSCodeUserProfilePath { param($UserName) "C:\Users\$UserName" }
+    Mock Test-VSCodePathAccess { [PSCustomObject]@{ Exists = $true; AccessDenied = $false } }
     Mock New-VSCodeDirectoryIfMissing { }
     Mock Get-VSCodeFileContent { $null }
     Mock Set-VSCodeFileContent { }
@@ -126,11 +127,19 @@ Context 'Resolve-VSCodeTargetUser' {
   }
 
   It 'parsed user has no profile directory -> falls back to SYSTEM dir, user kept, note set' {
-    Mock Test-VSCodeDirectoryExists { $false }
+    Mock Test-VSCodePathAccess { [PSCustomObject]@{ Exists = $false; AccessDenied = $false } }
     $result = Resolve-VSCodeTargetUser $script:JdoePath 'ms-python.python'
     $result.User | Should -Be 'jdoe'
     $result.ExtensionsDir | Should -Be $Script:RootFallbackExtensionsDir
     $result.ResolutionNote | Should -Be 'EXTENSION_PATH_USER_NOT_FOUND'
+  }
+
+  It 'parsed user has a profile directory that exists but cannot be accessed -> falls back to SYSTEM dir, distinct note from not-found' {
+    Mock Test-VSCodePathAccess { [PSCustomObject]@{ Exists = $true; AccessDenied = $true } }
+    $result = Resolve-VSCodeTargetUser $script:JdoePath 'ms-python.python'
+    $result.User | Should -Be 'jdoe'
+    $result.ExtensionsDir | Should -Be $Script:RootFallbackExtensionsDir
+    $result.ResolutionNote | Should -Be 'EXTENSION_PATH_USER_PROFILE_ACCESS_DENIED'
   }
 
   It 'missing path -> user $null, falls back to SYSTEM dir, never throws' {
@@ -436,7 +445,7 @@ Context 'Invoke-SetVSCodeExtensionVersion end-to-end' {
   }
 
   It 'extension_path names a user with no profile directory -> still proceeds, ran_as_root true' {
-    Mock Test-VSCodeDirectoryExists { $false }
+    Mock Test-VSCodePathAccess { [PSCustomObject]@{ Exists = $false; AccessDenied = $false } }
     $script:MockConfig.ListExtensionsStdout = "ms-python.python@2024.1.0`n"
     $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.1.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
     $result.target_user | Should -Be 'jdoe'

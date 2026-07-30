@@ -147,8 +147,9 @@ SSH_PREFIX=()
 SCP_PREFIX=()
 REMOTE=""
 # Space-separated scenario numbers to run (e.g. "15" or "5 15 17"); empty
-# means run everything. "5" covers both 5a and 5b together - they're one
-# numbered scenario with two cases, not two scenarios.
+# means run everything. "5" covers 5a/5b/5c together - they're one
+# numbered scenario with three cases (5c windows-only), not three
+# scenarios.
 ONLY_SCENARIOS=""
 # --platform mac-rtr only: target device AID for the real RTR session
 # (see run_dist_script's mac-rtr override, further down). Falcon API
@@ -552,6 +553,13 @@ case "$PLATFORM" in
     PATH_SEP="/"
     NO_SUCH_USER_PATH="/Users/glow_test_no_such_user/.vscode/extensions/${EXT_ID}-0.0.0"
     SYMLINK_TARGET="/tmp/glow_test_evil_target"
+    # Scenario 5c is Windows-only - there's no clean mac equivalent of
+    # Win32_UserProfile/icacls DENY ACEs to reproduce the exact "profile
+    # exists but access-denied" condition the Windows-side
+    # Test-VSCodePathAccess fix addresses. setup returning 1 (never
+    # succeeding here) makes the scenario skip cleanly on this platform.
+    setup_access_denied_profile_dir() { return 1; }
+    teardown_access_denied_profile_dir() { :; }
 
     if [[ ! -x "$CODE_BIN" ]]; then
       echo "Error: VS Code CLI not found at $CODE_BIN" >&2
@@ -1001,6 +1009,31 @@ PS
     PATH_SEP="\\"
     NO_SUCH_USER_PATH="C:\\Users\\glow_test_no_such_user\\.vscode\\extensions\\${EXT_ID}-0.0.0"
     SYMLINK_TARGET="C:\\Windows\\Temp\\glow_test_evil_target"
+    # Scenario 5c's own fixtures: a real directory shaped exactly like
+    # Resolve-VSCodeUserProfilePath's own naive-guess fallback for a
+    # username with no real Windows account (glow_test_locked_profile
+    # certainly has none, so SID translation fails and it falls back to
+    # this exact path) - then denied via a real icacls DENY ACE, so
+    # Test-VSCodePathAccess hits a genuine UnauthorizedAccessException,
+    # not a mock. "Everyone" covers both identities this script might
+    # actually run as (the plain admin SSH account, or SYSTEM under
+    # windows-rtr).
+    ACCESS_DENIED_TEST_DIR="C:\\Users\\glow_test_locked_profile"
+    ACCESS_DENIED_USER_PATH="${ACCESS_DENIED_TEST_DIR}\\.vscode\\extensions\\${EXT_ID}-0.0.0"
+    setup_access_denied_profile_dir() {
+      "${SSH_PREFIX[@]}" "${SSH_OPTS[@]}" "$REMOTE" \
+        "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path '$ACCESS_DENIED_TEST_DIR' | Out-Null; icacls '$ACCESS_DENIED_TEST_DIR' /deny 'Everyone:(OI)(CI)F' | Out-Null\""
+    }
+    # take ownership first, not a bare icacls /reset - a real "Everyone:
+    # deny full control" ACE also blocks WRITE_DAC (changing permissions
+    # itself), so a normal admin session can't reset it directly; taking
+    # ownership is a separate PRIVILEGE (SeTakeOwnershipPrivilege) real
+    # admin accounts hold regardless of the DACL, and owners can always
+    # rewrite their own object's DACL afterward.
+    teardown_access_denied_profile_dir() {
+      "${SSH_PREFIX[@]}" "${SSH_OPTS[@]}" "$REMOTE" \
+        "powershell -NoProfile -Command \"takeown /F '$ACCESS_DENIED_TEST_DIR' /R /D Y | Out-Null; icacls '$ACCESS_DENIED_TEST_DIR' /reset /T | Out-Null; Remove-Item -Recurse -Force '$ACCESS_DENIED_TEST_DIR' -ErrorAction SilentlyContinue\"" || true
+    }
 
     build_dist() {
       "$ROOT_DIR/ps_scripts/build.sh" >&2
@@ -1728,6 +1761,7 @@ restore_original_state() {
   # helper failing must never prevent restoring the extension's original
   # install state.
   teardown_symlink_scenario || echo "    WARNING: symlink-scenario artifact cleanup reported an error (continuing)"
+  teardown_access_denied_profile_dir || echo "    WARNING: scenario 5c's locked-profile-dir cleanup reported an error (continuing)"
   cleanup_deployed_script || echo "    WARNING: deployed-script cleanup reported an error (continuing)"
 
   # Safety net for scenario 15/16 state, in case the script exited before
@@ -1908,6 +1942,24 @@ else
   skip "real user's installed version is untouched by the root-fallback run" \
     "only meaningful when this script itself runs as root; re-run with sudo to verify"
   set_installed_version "0.4.0" # undo the side effect this non-root run just caused, before restore
+fi
+
+fi
+if scenario_enabled "5"; then
+echo
+echo "=== Scenario 5c: extension_path names a user whose profile directory exists but is access-denied -> distinct resolution note, not confused with not-found ==="
+if setup_access_denied_profile_dir; then
+  set_installed_version "0.4.0"
+  result="$(run_script "$LATEST_VERSION" "false" "$ACCESS_DENIED_USER_PATH")"
+  echo "  envelope: $result"
+  check "target_user is glow_test_locked_profile" "$(field "$result" target_user)" "glow_test_locked_profile"
+  check "ran_as_root is true" "$(field "$result" ran_as_root)" "True"
+  check "user_resolution_note is EXTENSION_PATH_USER_PROFILE_ACCESS_DENIED (not EXTENSION_PATH_USER_NOT_FOUND - the profile genuinely exists)" \
+    "$(field "$result" user_resolution_note)" "EXTENSION_PATH_USER_PROFILE_ACCESS_DENIED"
+  teardown_access_denied_profile_dir
+else
+  skip "extension_path names a user whose profile directory exists but is access-denied" \
+    "not applicable on this platform (see setup_access_denied_profile_dir)"
 fi
 
 fi
