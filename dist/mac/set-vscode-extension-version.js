@@ -257,6 +257,14 @@ var POLL_INTERVAL_SEC       = 0.1;
 // Installing/upgrading an extension downloads a VSIX over the network -
 // give it much longer than a quick local command before we give up.
 var INSTALL_CMD_TIMEOUT_SEC = 120;
+// The envelope is meant to stay compact (RTR/whatever consumes this
+// output shouldn't have to deal with an arbitrarily large payload for
+// what's fundamentally a pass/fail signal) - real `code` CLI output can
+// run to several KB (deprecation warnings, full marketplace install
+// logs, ...). The FULL text always still goes to the diag file first
+// (see truncateForEnvelope's own callers); this only bounds what
+// actually ends up in the returned JSON.
+var MAX_CLI_OUTPUT_ENVELOPE_LEN = 2000;
 
 var VSCODE = {
   codePath: '/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code',
@@ -575,7 +583,12 @@ function getSettingsPath(uid, user) {
 function enableSignatureBypass(settingsPath, uid) {
   var fileExisted = fileExists(settingsPath);
   var originalRaw = fileExisted ? readFileRaw(settingsPath) : null;
+  var backupPath = settingsPath + '.rwcbak';
 
+  // Parse BEFORE writing anything - an unparseable existing file must
+  // leave the real filesystem completely untouched (not even a backup
+  // created), matching this function's own "leaving it untouched"
+  // promise below.
   var settings = {};
   if (originalRaw && originalRaw.trim()) {
     try {
@@ -585,22 +598,42 @@ function enableSignatureBypass(settingsPath, uid) {
       return { applied: false };
     }
   }
+
+  // A REAL on-disk backup, not just originalRaw held in this process'
+  // own memory - if this process is killed before
+  // restoreSignatureVerification ever runs (RTR's own script-execution
+  // timeout, session termination, ...), the original content used to be
+  // gone for good, leaving verifySignature stuck false with no recovery
+  // path. writeFileRaw's own atomic write (writeToFileAtomicallyEncodingError)
+  // means this can't itself leave a half-written backup either. Only
+  // written when there's real original content to protect - the
+  // not-existed case has nothing to back up, and restoreSignatureVerification's
+  // own unconditional cleanup below handles clearing the backup path
+  // either way once this run's own restore actually happens.
+  if (fileExisted) {
+    writeFileRaw(backupPath, originalRaw, uid);
+  }
+
   settings['extensions.verifySignature'] = false;
   writeFileRaw(settingsPath, JSON.stringify(settings), uid);
 
-  return { applied: true, settingsPath: settingsPath, fileExisted: fileExisted, originalRaw: originalRaw, uid: uid };
+  return { applied: true, settingsPath: settingsPath, backupPath: backupPath, fileExisted: fileExisted, uid: uid };
 }
 
 function restoreSignatureVerification(state) {
   if (!state || !state.applied) return;
   try {
     if (state.fileExisted) {
-      writeFileRaw(state.settingsPath, state.originalRaw, state.uid);
+      // From the on-disk backup, not an in-memory variable - see
+      // enableSignatureBypass's own comment on why that matters.
+      var originalRaw = readFileRaw(state.backupPath);
+      writeFileRaw(state.settingsPath, originalRaw, state.uid);
     } else {
       removeFile(state.settingsPath);
     }
+    removeFile(state.backupPath);
   } catch (e) {
-    writeDiag('WARN: could not restore settings.json at ' + state.settingsPath + ': ' + e);
+    writeDiag('WARN: could not restore settings.json at ' + state.settingsPath + ' from backup ' + state.backupPath + ': ' + e);
   }
 }
 
@@ -770,6 +803,18 @@ function listInstalledExtensions(uid, user) {
   return runCode(uid, user, ['--list-extensions', '--show-versions']);
 }
 
+// Trims text for the envelope after logging the FULL, untruncated
+// version to diag first - the envelope is meant to stay compact (a
+// pass/fail signal, not a log dump), but nothing actually gets lost:
+// the complete output is always still recoverable from the diag file.
+function truncateForEnvelope(text, label) {
+  text = text || '';
+  writeDiag(label + ' (full, ' + text.length + ' chars): ' + text);
+  if (text.length <= MAX_CLI_OUTPUT_ENVELOPE_LEN) return text;
+  return text.slice(0, MAX_CLI_OUTPUT_ENVELOPE_LEN) +
+    '... [truncated, ' + text.length + ' chars total - see diag for the full text]';
+}
+
 function upgradeToLatest(uid, user, extId, dryRun) {
   if (dryRun) return { attempted: false, dry_run: true };
   // `code --upgrade-extension <id>` is NOT a real flag on this CLI (verified
@@ -782,8 +827,8 @@ function upgradeToLatest(uid, user, extId, dryRun) {
     attempted: true,
     exit_code: r.exitCode,
     ok: r.exitCode === 0,
-    stdout: (r.stdout || '').trim(),
-    stderr: (r.stderr || '').trim(),
+    stdout: truncateForEnvelope((r.stdout || '').trim(), 'upgradeToLatest stdout'),
+    stderr: truncateForEnvelope((r.stderr || '').trim(), 'upgradeToLatest stderr'),
   };
 }
 
@@ -796,8 +841,8 @@ function setExactVersion(uid, user, extId, version, dryRun) {
     attempted: true,
     exit_code: r.exitCode,
     ok: r.exitCode === 0,
-    stdout: (r.stdout || '').trim(),
-    stderr: (r.stderr || '').trim(),
+    stdout: truncateForEnvelope((r.stdout || '').trim(), 'setExactVersion stdout'),
+    stderr: truncateForEnvelope((r.stderr || '').trim(), 'setExactVersion stderr'),
   };
 }
 

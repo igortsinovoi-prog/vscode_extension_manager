@@ -56,6 +56,27 @@ $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
   envelope's `vscode_restarted` field reports whether this happened). Never
   launched if it wasn't already running; never restarted for a no-op or
   dry-run action.
+- **On Windows, that restart is a real force-kill, not a graceful close,
+  despite attempting the latter first.** Before force-killing, the script
+  does try a graceful `WM_CLOSE` request (the same signal a user clicking
+  the window's own close button sends) and waits up to 10s for VS Code to
+  exit on its own - but confirmed directly, against a real VS Code window,
+  that this reliably never succeeds in this script's actual deployment
+  context: `.NET`'s `Process.MainWindowHandle` (what a graceful close
+  needs) cannot see a window owned by a different login session, and a
+  real RTR/managed deployment always runs non-interactively (as `SYSTEM`),
+  in a different session than whichever interactive session is actually
+  rendering VS Code's window. **Unsaved work in the target user's VS Code
+  window will be lost** when a real, changed version update happens while
+  it's open - there is no Windows equivalent of macOS's `launchctl asuser`
+  that would let this reach the right session for a real graceful close.
+  The 10s attempt is kept anyway (harmless, and a real no-op if some
+  future Windows/RTR change ever does let it reach the right session), but
+  don't rely on it actually protecting anyone's unsaved changes today. On
+  macOS, the equivalent restart genuinely is graceful (a real quit
+  AppleEvent via `launchctl asuser`, polled, with force-kill only as an
+  actual last resort) - this asymmetry is a real platform limitation, not
+  an oversight.
 - **A version pin survives VS Code's own passive/startup extension-update
   check**, by design (that's the whole point) - but **does not** survive an
   explicit `code --update-extensions` invocation elsewhere on the same
@@ -196,6 +217,58 @@ purely internal test-harness plumbing):
   this script spawns is now defensively pinned to `/tmp` (`1777`,
   traversable by any user) rather than trusting whatever directory the
   calling environment happened to be sitting in.
+- **Windows: a graceful restart is not actually achievable from this
+  script's real deployment context** - see "Behavior worth knowing"
+  above for the full explanation (`Process.MainWindowHandle` can't see a
+  window owned by a different login session, and RTR always runs
+  non-interactively). Confirmed directly against a real VS Code window
+  under a real RTR-shaped session: every real `Code.exe` process showed
+  `MainWindowHandle=0` from that vantage point, and the graceful attempt
+  reliably burns its full ~10s wait before falling through to a force-
+  kill, every time. Kept anyway as a real no-op safety margin rather than
+  reverted to an immediate force-kill.
+- **Windows: three `.NET`-surface assumptions were PowerShell 7-only,
+  silently broken under real RTR's actual runtime** -
+  `ProcessStartInfo.ArgumentList` is `$null` under Windows PowerShell 5.1
+  (fixed: build the argument string manually, Win32/CommandLineToArgvW-
+  compatible quoting); `Process.Kill($true)` (kill the entire child-
+  process tree) is a .NET Core-only overload that throws under 5.1's
+  .NET Framework, previously silently swallowed - and even the naive
+  single-process `Kill()` fallback isn't enough, since `code.cmd` is
+  always launched via a `cmd.exe` wrapper whose own children were left
+  orphaned and running; fixed with `taskkill /T /F`, confirmed to
+  actually kill the whole tree. `ConvertFrom-Json -AsHashtable` is
+  PowerShell 6+-only; fixed by walking `.PSObject.Properties` instead,
+  which works on both. This project's own mocked/SSH-driven testing
+  never caught any of these - it always exercised a bootstrapped `pwsh`
+  7, never real RTR's actual `powershell.exe` 5.1.
+- **Both platforms: a process killed mid-write could lose settings.json's
+  original content for good** - the signature-verification bypass used
+  to keep the original raw content only in this process' own memory
+  while temporarily disabling `extensions.verifySignature`; a process
+  killed before its own restore step ran (a real RTR timeout, session
+  termination, ...) left that setting stuck `false` with no way back.
+  Both platforms now also write a real on-disk backup before touching
+  anything, and restore from that file, not memory - and the Windows
+  write itself is now atomic (temp file + rename on the same volume),
+  matching what the macOS side's own write already guaranteed.
+- **Windows: `Test-Path`'s bare boolean can't tell "doesn't exist" from
+  "access denied"** - a target user's profile that genuinely exists but
+  can't actually be read/written (restrictive NTFS permissions, ...) was
+  silently reported the same way as "this account has no profile at
+  all". Confirmed directly with a real `deny everyone full control` ACE
+  that neither `Get-Item` nor `Get-ChildItem` reliably detects it for an
+  Administrator-group account (real reads/lists apparently don't hit the
+  same access check this cares about) - only a real write-and-delete
+  probe does, matching the actual failure this exists to catch.
+- **Windows: `C:\Users\<user>` is not always where a user's profile
+  actually lives** - a relocated profile (another drive) or a folder
+  name that no longer matches the account's current login name (Windows
+  keeps the original folder name across a rename) silently fell through
+  the cracks. Fixed by resolving the real path via `Win32_UserProfile`
+  (translate the username to its SID, look up that SID's own
+  `LocalPath`), falling back to the naive guess only if that lookup
+  itself fails.
 
 See the repo root's own `README.md` for full architecture details, and
 `real_world_check_set_vscode_extension_version.sh --help` for every

@@ -49,6 +49,24 @@ script needs a one-shot Scheduled Task with `-LogonType Interactive`,
 registered, triggered, and unregistered again immediately
 (`Restart-VSCodeIfRunning`).
 
+`Restart-VSCodeIfRunning` tries a graceful `WM_CLOSE` first (via
+`Invoke-VSCodeCloseMainWindow`), polls up to 10s, and only force-kills what's
+still running after that - matching the macOS side's own quit-AppleEvent-
+then-poll-then-SIGKILL shape. **Confirmed this graceful attempt cannot
+actually succeed in this script's real deployment context**, though:
+`Process.MainWindowHandle` (what a graceful close needs) can't see a window
+owned by a different login session, and RTR always runs non-interactively
+(as SYSTEM) in a different session than whichever interactive session is
+actually rendering VS Code's window - confirmed directly against a real
+window under a real RTR-shaped session, every `Code.exe` process showed
+`MainWindowHandle=0` from that vantage point. Kept anyway (a real no-op
+safety margin, not reverted to an immediate force-kill) - see `dist/README.md`
+for the full writeup and what this means for a real deployment: unsaved
+work in the target user's VS Code window is lost when a real, changed
+version update forces a restart while it's open. No such gap exists on
+macOS, where `launchctl asuser` genuinely reaches the target session for a
+real graceful quit.
+
 ## Running everything
 
 `run_all_tests.sh` (repo root) is a single entry point that runs every

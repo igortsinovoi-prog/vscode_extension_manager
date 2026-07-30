@@ -709,14 +709,83 @@ function Get-VSCodeGuiExePath {
   return Join-Path $installDir 'Code.exe'
 }
 
+# Sends a graceful close request (WM_CLOSE) to a process' main window -
+# the same signal a user clicking that window's own close button would
+# send, giving VS Code a real chance to save state/exit cleanly before
+# ever being force-killed.
+#
+# IMPORTANT, confirmed via a real RTR-shaped (non-interactive) session
+# against a real VS Code window: this reliably does NOT work under this
+# script's actual real deployment context. Process.MainWindowHandle (what
+# CloseMainWindow needs) cannot see a window owned by a different login
+# session, and RTR always runs non-interactively (as SYSTEM) in a
+# different session than whatever interactive session is actually
+# rendering VS Code's window - confirmed directly: every real Code.exe
+# process showed MainWindowHandle=0 from this exact vantage point. This
+# is the identical session-isolation boundary that scenario 15's own
+# watcher-task infrastructure exists to cross for GUI automation - but
+# that's opt-in test tooling, not part of this production code path.
+# macOS has no equivalent problem: launchctl asuser genuinely lets a
+# root process reach into the target session for real AppleEvents.
+#
+# Kept anyway (not reverted to an immediate force-kill) - gentlest-action-
+# first is still the right instinct, this costs one bounded ~10s wait
+# per real restart, and it's a real no-op if some future Windows/RTR
+# change ever does let this reach the right session. Just don't expect
+# it to actually save anyone's unsaved work in a real deployment today -
+# see the shipped README's own "Behavior worth knowing" section.
+#
+# Wrapped as its own function (not Get-Process + .CloseMainWindow()
+# inlined at the call site) specifically so it's mockable as a single
+# unit in tests - a real Process object's own CloseMainWindow() is a
+# .NET object method, not a PowerShell command, so Pester's Mock can't
+# intercept it directly; this matches the same established pattern
+# already used for Get-VSCodeProcessOwners, Resolve-VSCodeUserProfilePath,
+# and Test-VSCodePathAccess.
+function Invoke-VSCodeCloseMainWindow {
+  param([int]$ProcessId)
+  try {
+    $proc = Get-Process -Id $ProcessId -ErrorAction Stop
+    [void]$proc.CloseMainWindow()
+  } catch {}
+}
+
 function Restart-VSCodeIfRunning {
   param([string]$TargetUser, [string]$CodePath)
   if (-not $TargetUser) { return $false }
   $pids = Get-VSCodeRunningPidsForUser $TargetUser
   if ($pids.Count -eq 0) { return $false }
 
+  # Gentlest action first, matching the mac side's own quit-AppleEvent-
+  # then-poll-then-SIGKILL sequence (real_world_check's own
+  # kill_vscode_gui_session) - a real, changed version only helps the
+  # user once VS Code actually reloads it, but force-killing a window
+  # that might have unsaved state is the LAST resort, not the first.
   foreach ($procId in $pids) {
-    try { Stop-Process -Id $procId -Force -ErrorAction Stop } catch {}
+    Invoke-VSCodeCloseMainWindow $procId
+  }
+
+  $waited = 0
+  while ((Get-VSCodeRunningPidsForUser $TargetUser).Count -gt 0 -and $waited -lt 10) {
+    Start-Sleep -Seconds 1
+    $waited++
+  }
+
+  # Last resort - anything still running after the graceful close had
+  # its full chance. Logged either way (not just the force-kill branch)
+  # so a real run's own diag file shows which path was actually taken -
+  # useful given Invoke-VSCodeCloseMainWindow's own comment: confirmed
+  # via real_world_check's own scenario 17 against a real RTR-shaped
+  # session that this reliably falls through to here, every time, in
+  # this script's actual real deployment context.
+  $stillRunning = Get-VSCodeRunningPidsForUser $TargetUser
+  if ($stillRunning.Count -eq 0) {
+    Write-VSCodeDiag "Restart-VSCodeIfRunning: graceful close succeeded within ${waited}s, no force-kill needed"
+  } else {
+    Write-VSCodeDiag "Restart-VSCodeIfRunning: still running after ${waited}s graceful-close window, force-killing: $($stillRunning -join ',')"
+    foreach ($procId in $stillRunning) {
+      try { Stop-Process -Id $procId -Force -ErrorAction Stop } catch {}
+    }
   }
 
   $guiExePath = Get-VSCodeGuiExePath $CodePath

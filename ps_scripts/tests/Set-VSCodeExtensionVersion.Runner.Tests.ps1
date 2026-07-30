@@ -82,6 +82,7 @@ Describe 'Set-VSCodeExtensionVersion.Runner' {
     }
 
     $script:StopProcessLog = New-Object System.Collections.Generic.List[object]
+    $script:GracefulCloseLog = New-Object System.Collections.Generic.List[object]
     $script:ScheduledTaskLog = New-Object System.Collections.Generic.List[object]
     Mock Get-VSCodeProcessOwners {
       param($ProcessName)
@@ -93,6 +94,20 @@ Describe 'Set-VSCodeExtensionVersion.Runner' {
       param($Id)
       $script:StopProcessLog.Add($Id)
     }
+    # Default: simulate the process actually exiting in response to the
+    # graceful close, matching the common real-world case - a dedicated
+    # test below overrides this to leave RunningPids populated instead,
+    # exercising the force-kill fallback.
+    Mock Invoke-VSCodeCloseMainWindow {
+      param($ProcessId)
+      $script:GracefulCloseLog.Add($ProcessId)
+      $script:MockConfig.RunningPids = @()
+    }
+    # Real Start-Sleep would make Restart-VSCodeIfRunning's own polling
+    # loop actually wait - up to 10 real seconds per test that exercises
+    # the force-kill fallback path. Mocked everywhere so the whole suite
+    # stays fast regardless of which path a given test takes.
+    Mock Start-Sleep { }
     # New-ScheduledTaskAction/New-ScheduledTaskPrincipal deliberately NOT
     # mocked - they're cheap, pure, side-effect-free object constructors,
     # and mocking them turned out to matter: Register-ScheduledTask's real
@@ -332,17 +347,42 @@ Context 'Get-VSCodeRunningPidsForUser / Restart-VSCodeIfRunning' {
     $script:ScheduledTaskLog.Count | Should -Be 0
   }
 
-  It 'running -> stops the process, then registers/starts/unregisters a one-shot interactive Scheduled Task pointed at Code.exe' {
+  It 'running, closes gracefully -> a graceful close is tried first and is enough, no force-kill needed, then registers/starts/unregisters a one-shot interactive Scheduled Task pointed at Code.exe' {
     $script:MockConfig.RunningPids = @(4242)
     $result = Restart-VSCodeIfRunning 'jdoe' 'C:\Program Files\Microsoft VS Code\bin\code.cmd'
     $result | Should -BeTrue
-    $script:StopProcessLog | Should -Be @(4242)
+    $script:GracefulCloseLog | Should -Be @(4242)
+    # The default mock simulates the process actually exiting in
+    # response to the graceful close - Stop-Process should never be
+    # needed at all in that case.
+    $script:StopProcessLog.Count | Should -Be 0
 
     ($script:ScheduledTaskLog | Select-Object -ExpandProperty Event) | Should -Be @('register', 'start', 'unregister')
     $registerEntry = $script:ScheduledTaskLog | Where-Object { $_.Event -eq 'register' }
     $registerEntry.Action.Execute | Should -Be 'C:\Program Files\Microsoft VS Code\Code.exe'
     $registerEntry.Principal.UserId | Should -Be 'jdoe'
     $registerEntry.Principal.LogonType | Should -Be 'Interactive'
+  }
+
+  It 'running, does not close gracefully -> falls back to force-kill after the graceful close had its full chance, then still relaunches' {
+    $script:MockConfig.RunningPids = @(4242)
+    # Override the default "success" simulation - the process stays
+    # "running" (RunningPids never clears) despite the graceful close
+    # attempt, exercising the force-kill fallback.
+    Mock Invoke-VSCodeCloseMainWindow {
+      param($ProcessId)
+      $script:GracefulCloseLog.Add($ProcessId)
+    }
+    $result = Restart-VSCodeIfRunning 'jdoe' 'C:\Program Files\Microsoft VS Code\bin\code.cmd'
+    $result | Should -BeTrue
+    # Graceful close was still tried first...
+    $script:GracefulCloseLog | Should -Be @(4242)
+    # ...gave it the full poll window (Start-Sleep mocked, so this
+    # doesn't actually wait 10 real seconds)...
+    Should -Invoke Start-Sleep -Times 10
+    # ...and only THEN force-killed it as the last resort.
+    $script:StopProcessLog | Should -Be @(4242)
+    ($script:ScheduledTaskLog | Select-Object -ExpandProperty Event) | Should -Be @('register', 'start', 'unregister')
   }
 }
 
@@ -412,7 +452,10 @@ Context 'Invoke-SetVSCodeExtensionVersion end-to-end' {
     $result.status | Should -Be 'success'
     $result.changed | Should -BeTrue
     $result.vscode_restarted | Should -BeTrue
-    $script:StopProcessLog | Should -Be @(4242)
+    # Graceful close first (the default mock simulates it succeeding) -
+    # Stop-Process is the last-resort fallback, not needed here.
+    $script:GracefulCloseLog | Should -Be @(4242)
+    $script:StopProcessLog.Count | Should -Be 0
   }
 
   It 'already at the target version (no change) -> never attempts a restart even if VS Code is running' {
