@@ -50,6 +50,11 @@ Describe 'Set-VSCodeExtensionVersion.Runner' {
     Mock Test-VSCodeFileExists { $true }
     Mock Test-VSCodeDirectoryExists { $true }
     Mock Resolve-VSCodeSafePath { param($Path) return $Path }
+    # Matches the old hardcoded "C:\Users\<user>" behavior these tests
+    # were already written against - Resolve-VSCodeUserProfilePath's own
+    # real Win32_UserProfile lookup (and its fallback) is covered by its
+    # own dedicated tests below, not re-verified by every other test here.
+    Mock Resolve-VSCodeUserProfilePath { param($UserName) "C:\Users\$UserName" }
     Mock New-VSCodeDirectoryIfMissing { }
     Mock Get-VSCodeFileContent { $null }
     Mock Set-VSCodeFileContent { }
@@ -526,4 +531,25 @@ Context 'JSON envelope field casing (raw wire format, not just case-insensitive 
     ($rawJson -cmatch '"Message"') | Should -BeFalse
   }
 }
+}
+
+# A separate, sibling Describe (not nested inside the one above) so this
+# one is NOT subject to that Describe's own BeforeEach, which mocks
+# Resolve-VSCodeUserProfilePath itself for every other test in this file -
+# this is the one place that function's REAL body actually runs. Its
+# happy path (NTAccount.Translate + Get-CimInstance Win32_UserProfile)
+# can't be meaningfully exercised here at all: NTAccount.Translate() is a
+# .NET object method, not a PowerShell command, so Pester's Mock can't
+# intercept it, and there's no real "jdoe" account on a test machine to
+# translate anyway - this project's own Runner.Tests.ps1 header already
+# documents mocking chained CIM calls as unreliable, so this doesn't
+# attempt it. What IS both real and reliably testable: a nonexistent
+# account genuinely fails NTAccount.Translate() (a real
+# IdentityNotMappedException, not a mock), which is exactly the fallback
+# path - so this exercises the real error handling for real, no mocking
+# needed at all.
+Describe 'Resolve-VSCodeUserProfilePath (real, unmocked)' {
+  It 'falls back to the naive C:\Users\USERNAME guess when the account cannot be resolved via Win32_UserProfile' {
+    Resolve-VSCodeUserProfilePath 'definitely-not-a-real-account-98765' | Should -Be 'C:\Users\definitely-not-a-real-account-98765'
+  }
 }

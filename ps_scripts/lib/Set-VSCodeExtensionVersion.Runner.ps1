@@ -361,6 +361,36 @@ function Invoke-VSCodeNativeCommand {
 
 # ===== Section 4: Target User Resolution (never aborts) =====
 
+# Resolves a username to its REAL profile directory via Win32_UserProfile
+# (translate the username to its SID, then look up that SID's own
+# LocalPath) - not a hardcoded "C:\Users\<user>" guess, which silently
+# breaks for a profile relocated to another drive/path, or a folder name
+# that no longer matches the account's current username (Windows keeps
+# the ORIGINAL profile folder name across a user rename; only the
+# account's own login name changes). Wrapped as one function (not
+# separate NTAccount.Translate()/Get-CimInstance calls inlined at each
+# call site) specifically so it can be mocked as a single unit in tests -
+# this project's own Runner.Tests.ps1 already documents mocking chained
+# CIM calls directly as unreliable; wrapping the real system calls in one
+# function and mocking that instead is the established fix. Never
+# aborts: any failure (restricted CIM access, no matching profile, ...)
+# falls back to the naive guess rather than throwing, matching every
+# other function in this section.
+function Resolve-VSCodeUserProfilePath {
+  param([string]$UserName)
+  $fallback = "C:\Users\$UserName"
+  try {
+    $sid = (New-Object System.Security.Principal.NTAccount($UserName)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+    $userProfile = Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$sid'" -ErrorAction Stop
+    if ($userProfile -and $userProfile.LocalPath) {
+      return $userProfile.LocalPath
+    }
+  } catch {
+    Write-VSCodeDiag "WARN: could not resolve `"$UserName`"'s real profile path via Win32_UserProfile: $_ - falling back to $fallback"
+  }
+  return $fallback
+}
+
 # Combines the pure path-format validation (Get-VSCodeExtensionPathUser)
 # with a real filesystem safety check and a profile-directory existence
 # check, then decides the effective extensions directory to operate
@@ -390,7 +420,7 @@ function Resolve-VSCodeTargetUser {
     return [PSCustomObject]@{ User = $parsed.User; ExtensionsDir = $Script:RootFallbackExtensionsDir; ResolutionNote = 'EXTENSION_PATH_UNSAFE' }
   }
 
-  $userProfileDir = "C:\Users\$($parsed.User)"
+  $userProfileDir = Resolve-VSCodeUserProfilePath $parsed.User
   if (-not (Test-VSCodeDirectoryExists $userProfileDir)) {
     Write-VSCodeDiag "WARN: extension_path names user `"$($parsed.User)`" but no such profile directory exists - falling back to SYSTEM's own extensions dir"
     return [PSCustomObject]@{ User = $parsed.User; ExtensionsDir = $Script:RootFallbackExtensionsDir; ResolutionNote = 'EXTENSION_PATH_USER_NOT_FOUND' }
@@ -422,7 +452,7 @@ function Find-VSCodeCli {
     $candidates.Add((Join-Path $env:LOCALAPPDATA 'Programs\Microsoft VS Code\bin\code.cmd'))
   }
   if ($TargetUser) {
-    $candidates.Add("C:\Users\$TargetUser\AppData\Local\Programs\Microsoft VS Code\bin\code.cmd")
+    $candidates.Add((Join-Path (Resolve-VSCodeUserProfilePath $TargetUser) 'AppData\Local\Programs\Microsoft VS Code\bin\code.cmd'))
   }
 
   foreach ($candidate in $candidates) {
