@@ -271,13 +271,22 @@ function Get-VSCodeRunOutcome {
   }
 
   if ($actionFailed) {
+    # UPGRADE_INCOMPLETE, not a script-local code: the CLI ran and failed
+    # with no more specific classification available - see
+    # glow-template's docs/reference/uniformity-conventions.md registered error-code list. $stderr is
+    # folded into Message (not a separate error-object field - the
+    # canonical envelope-level/target-level error shape is exactly
+    # {code, message}, no stderr key; the raw text still needs to reach
+    # the caller for diagnosis, so it goes into the message itself
+    # instead of being dropped).
+    $msg = 'code --install-extension failed'
+    if ($stderr) { $msg = "${msg}: $stderr" }
     return [PSCustomObject]@{
       Status  = 'failure'
       Changed = $false
       Error   = [PSCustomObject]@{
-        Code    = 'EXTENSION_VERSION_CHANGE_FAILED'
-        Message = 'code --install-extension/--upgrade-extension failed'
-        Stderr  = $stderr
+        Code    = 'UPGRADE_INCOMPLETE'
+        Message = $msg
       }
     }
   }
@@ -354,7 +363,7 @@ function Get-VSCodeRunOutcome {
 #   - Diag   : file-only at C:\Windows\Temp\glow\rtr.txt. Never stderr.
 #
 # Local testing (no args uses safe defaults: dry_run=true):
-#   $json = '{"params":{"extension_id":"ms-python.python","version":"2024.1.0","extension_path":"C:\\Users\\jdoe\\.vscode\\extensions\\ms-python.python-2024.5.0"},"dry_run":true}'
+#   $json = '{"params":{"extension_id":"ms-python.python","desired_version":"2024.1.0","extension_path":"C:\\Users\\jdoe\\.vscode\\extensions\\ms-python.python-2024.5.0"},"dry_run":true}'
 #   $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
 #   .\dist\Set-VSCodeExtensionVersion.ps1 $b64
 # =====================================================================
@@ -494,22 +503,109 @@ function Get-VSCodeFileContent {
   return Get-Content -LiteralPath $Path -Raw
 }
 
+# Fleet's canonical atomic-write pattern (glow-template
+# docs/reference/shared-helpers-win.md, Write-AtomicText / "Atomic write
+# (R3)") for anything that can hold secrets (vscode settings.json
+# qualifies) - more than plain temp+rename.
+#
+# Write to a "$Path.glow-tmp" temp file in the SAME directory first (same
+# volume, so the final swap-in is a single filesystem operation, not a
+# copy+delete that could be interrupted partway) as UTF-8 WITHOUT a BOM
+# (Set-Content -Encoding utf8 writes a BOM on PS 5.1 - the canonical
+# pattern uses [System.IO.File]::WriteAllText with an explicit
+# no-BOM UTF8Encoding instead) - a process killed mid-write (RTR's own
+# script-execution timeout, session termination, ...) can otherwise leave
+# the target truncated/corrupted instead of either its old or new content
+# intact.
+#
+# For the actual swap-in, [System.IO.File]::Replace (not Move-Item
+# -Force): confirmed on real hardware that Move-Item is delete-then-rename
+# under the hood on Windows, and lost data under AV/Defender file-lock
+# contention in testing - Replace handled the same contention cleanly.
+# Replace needs an existing destination (it's a true "replace", not a
+# plain move) - a brand-new file (nothing at $Path yet) has nothing to
+# replace or back up, so that case still just moves the temp file into
+# place directly, then sets ownership explicitly from the nearest
+# existing ancestor directory's ACL (NTFS inheritance does not propagate
+# Owner under SYSTEM, so a net-new file cannot just be left to inherit).
+# A short bounded retry (two attempts, brief pause between) absorbs the
+# same kind of transient lock contention Replace itself was chosen to
+# survive - retried generically on ANY exception, not matched by .NET
+# exception type: PowerShell can wrap a static .NET method's own thrown
+# exception as MethodInvocationException, and a typed catch on the
+# underlying type does not reliably match.
+#
+# If Replace ever throws in a way that leaves $Path missing entirely (not
+# just unchanged - genuinely gone), restore it immediately from Replace's
+# own "$Path.glow-netbak" throwaway backup, before that backup gets
+# cleaned up, so a caller never observes the destination vanish even
+# momentarily. That throwaway backup can carry the file's PRIOR content
+# (potentially secrets) - it is always deleted, success or failure, once
+# this call is done with it; a stranded copy is a real exposure, not just
+# clutter.
+#
+# For an EXISTING file, the original's own ACL is captured before the
+# write and explicitly reapplied to $Path after a successful swap - not
+# just trusted to survive the replace unexamined.
 function Set-VSCodeFileContent {
   param([string]$Path, [string]$Content)
-  # Atomic write: write to a temp file in the SAME directory (same
-  # volume, so the final move is a single filesystem rename, not a
-  # copy+delete that could be interrupted partway) then move it over the
-  # real path - a process killed mid-write (RTR's own script-execution
-  # timeout, session termination, ...) can otherwise leave settings.json
-  # truncated/corrupted (a half-written file) instead of either its old
-  # or new content intact.
   $dir = Split-Path -Path $Path -Parent
-  $tempPath = Join-Path $dir ([System.IO.Path]::GetRandomFileName())
+  $hadExisting = Test-VSCodeFileExists $Path
+  $origAcl = if ($hadExisting) { Get-VSCodeFileAcl $Path } else { $null }
+  $tempPath = "$Path.glow-tmp"
+  $netBackupPath = "$Path.glow-netbak"
   try {
-    Set-Content -LiteralPath $tempPath -Value $Content -Encoding utf8
-    Move-Item -LiteralPath $tempPath -Destination $Path -Force
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($tempPath, $Content, $utf8NoBom)
+
+    if (-not $hadExisting) {
+      Move-Item -LiteralPath $tempPath -Destination $Path -Force
+      $ancestorAcl = Get-VSCodeFileAcl $dir
+      Set-VSCodeFileAcl $Path $ancestorAcl
+      return
+    }
+
+    $attempt = 0
+    while ($true) {
+      $attempt++
+      try {
+        [System.IO.File]::Replace($tempPath, $Path, $netBackupPath)
+        break
+      } catch {
+        if (-not (Test-VSCodeFileExists $Path) -and (Test-VSCodeFileExists $netBackupPath)) {
+          Write-VSCodeDiag "WARN: [System.IO.File]::Replace left ${Path} missing after a failed attempt (${_}) - restoring from its own backup"
+          Move-Item -LiteralPath $netBackupPath -Destination $Path -Force -ErrorAction SilentlyContinue
+        }
+        if ($attempt -ge 2) { throw }
+        Start-Sleep -Milliseconds 200
+      }
+    }
+    Set-VSCodeFileAcl $Path $origAcl
   } finally {
     Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $netBackupPath -Force -ErrorAction SilentlyContinue
+  }
+}
+
+# Thin wrappers around Get-Acl/Set-Acl - same rationale as this file's
+# other single-seam wrappers (Get-VSCodeProcessOwners,
+# Resolve-VSCodeUserProfilePath, ...): mockable as one unit in tests
+# rather than mocking a real cmdlet directly. Never throws: a permissions
+# read/write failure here is logged, not fatal - matches this file's own
+# "never aborts the run over diagnostics-adjacent state" philosophy.
+function Get-VSCodeFileAcl {
+  param([string]$Path)
+  try { return Get-Acl -LiteralPath $Path -ErrorAction Stop } catch {
+    Write-VSCodeDiag "WARN: could not read ACL for ${Path}: $_"
+    return $null
+  }
+}
+
+function Set-VSCodeFileAcl {
+  param([string]$Path, $Acl)
+  if (-not $Acl) { return }
+  try { Set-Acl -LiteralPath $Path -AclObject $Acl -ErrorAction Stop } catch {
+    Write-VSCodeDiag "WARN: could not apply captured permissions to ${Path}: $_"
   }
 }
 
@@ -520,19 +616,84 @@ function Remove-VSCodeFileIfExists {
   }
 }
 
+# Rejects non-local volume types - network shares and optical media,
+# per glow-template's canonical Test-SafeLocalPath (docs/reference/
+# shared-helpers-win.md #3). Deliberately checks DriveType against
+# Network/CDRom specifically, not "anything other than Fixed" - a real
+# user profile occasionally legitimately lives on Removable media in
+# unusual setups, and the canonical guard does not reject that case.
+function Test-VSCodeLocalDrive {
+  param([string]$Path)
+  try {
+    # Confirmed real bug via actual execution on real hardware: .NET
+    # Framework's Path.GetPathRoot on a "\\?\C:\..." extended-length path
+    # returns the WHOLE "\\?\C:\" prefix as the root, and
+    # [System.IO.DriveInfo]::new() throws on that shape (it wants a bare
+    # "C:\"/"C" form) - which silently made every \\?\-prefixed path
+    # fail this check and get rejected as unsafe, exactly backwards from
+    # the intent of explicitly allowing that syntax. Strip the \\?\
+    # prefix before computing the root, matching glow-template's own
+    # canonical Test-SafeLocalPath.
+    $normalized = $Path
+    if ($normalized.StartsWith('\\?\')) { $normalized = $normalized.Substring(4) }
+    $root = [System.IO.Path]::GetPathRoot($normalized)
+    if (-not $root) { return $false }
+    $driveType = ([System.IO.DriveInfo]::new($root)).DriveType
+    return ($driveType -ne [System.IO.DriveType]::Network -and $driveType -ne [System.IO.DriveType]::CDRom)
+  } catch {
+    return $false
+  }
+}
+
+# Walks EVERY ancestor directory above $Path (not just $Path's own leaf,
+# which the reparse-point check below this function already covers)
+# looking for a reparse point (symlink/junction) - a symlinked ancestor
+# two levels up can redirect the whole path somewhere unexpected even if
+# the leaf itself looks completely clean. Fails closed: any ancestor that
+# can't be inspected for a reason other than "doesn't exist" (permission
+# denied, unexpected I/O error), or that turns out to itself be a reparse
+# point, makes the whole path unsafe. A missing ancestor is NOT itself
+# unsafe (nothing live there to be fooled by) - keep walking upward in
+# case a real ancestor further up still exists and is the actual
+# reparse point.
+function Test-VSCodeAncestorChainSafe {
+  param([string]$Path)
+  $current = Split-Path -Path $Path -Parent
+  while ($current) {
+    try {
+      $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+      if ($item.LinkType) { return $false }
+    } catch [System.Management.Automation.ItemNotFoundException] {
+      # Doesn't exist on disk - fine, nothing live to be fooled by here.
+    } catch {
+      return $false
+    }
+    $parent = Split-Path -Path $current -Parent
+    if ($parent -eq $current) { break } # reached a drive root
+    $current = $parent
+  }
+  return $true
+}
+
 # Resolves symlink/junction reparse points and standardizes the path, then
 # lets the caller re-parse the result and compare against the original
 # string-level parse - the same two-step defense as the macOS side's
 # resolveSafe: string-level parsing alone can be fooled by a symlinked path
 # component claiming to belong to one user while actually resolving
-# elsewhere on disk. Best-effort only: resolves the leaf's own reparse
-# point, not every ancestor directory in the chain (same caveat the macOS
-# original carries, just via a different OS API).
+# elsewhere on disk. Two checks, per the fleet's canonical safe-path guard:
+# a generic one (UNC paths, control characters, .. traversal, non-local
+# drive types) plus a second pass (Test-VSCodeAncestorChainSafe) that
+# walks every ancestor directory, not just the final path component.
 function Resolve-VSCodeSafePath {
   param([string]$Path)
   if (-not $Path) { return $null }
   if ($Path -match '[\x00-\x1f]') { return $null }
   if ($Path.IndexOf('..') -ne -1) { return $null }
+  # \\?\-prefixed paths are the extended-length local-path syntax, not a
+  # UNC share, and must NOT be rejected here - only a real \\server\share
+  # UNC path is.
+  if ($Path.StartsWith('\\') -and -not $Path.StartsWith('\\?\')) { return $null }
+  if (-not (Test-VSCodeLocalDrive $Path)) { return $null }
   try {
     $resolved = [System.IO.Path]::GetFullPath($Path)
   } catch { return $null }
@@ -550,15 +711,12 @@ function Resolve-VSCodeSafePath {
     # run) - fine, there's no live reparse point to be fooled by; fall
     # through using the string-normalized path.
   }
+  if (-not (Test-VSCodeAncestorChainSafe $resolved)) { return $null }
   return $resolved
 }
 
 # ===== Section 3: Process Helper =====
 
-# Runs a command with a timeout, combining stdout+stderr into one string
-# (like shell's 2>&1) - same rationale as the macOS side's single-NSPipe
-# approach: simpler, and sidesteps any risk of a full stderr buffer
-# deadlocking a caller that's only draining stdout.
 # Win32/CommandLineToArgvW-compatible argument quoting (the same algorithm
 # .NET's own ProcessStartInfo.ArgumentList uses internally to build the
 # actual native command line) - needed because ArgumentList itself is
@@ -600,81 +758,102 @@ function ConvertTo-VSCodeArgumentString {
   return (($Arguments | ForEach-Object { ConvertTo-VSCodeQuotedArgument $_ }) -join ' ')
 }
 
+# FIX (real-run 2026-08-05): this used to capture stdout/stderr via
+# Register-ObjectEvent on the process's OutputDataReceived/
+# ErrorDataReceived events plus BeginOutputReadLine/BeginErrorReadLine.
+# The fleet has a documented, confirmed case of a closely related pattern
+# (a scriptblock subscribed directly to those same .NET events, not
+# through Register-ObjectEvent's own PowerShell eventing layer) reliably
+# crashing the ENTIRE PowerShell host process under real Windows
+# PowerShell 5.1, mid-WaitForExit, confirmed via Windows Error Reporting -
+# close enough to the same risk family to remove the risk category
+# outright rather than prove this particular variant is safe the hard
+# way. Fix: skip async event-driven capture entirely - always launch
+# through cmd.exe (needed anyway for a .cmd/.bat target, since
+# UseShellExecute=false does not consult the registry file association
+# that lets ShellExecute run those directly) and redirect stdout/stderr
+# to plain temp files via cmd.exe's own >/2> operators, then read the
+# files back after WaitForExit returns. Nothing in this process ever
+# subscribes to a .NET stream event.
+#
+# Incidental improvement from the same change: Stdout/Stderr are now
+# genuinely separate (previously both fields held the same
+# stdout+stderr-combined text, a simplification carried over from the
+# old NSPipe-style single-buffer capture, which no longer applies once
+# each stream writes to its own file).
 function Invoke-VSCodeNativeCommand {
   param(
     [Parameter(Mandatory)][string]$FilePath,
     [string[]]$ArgumentList = @(),
     [int]$TimeoutSec = $Script:DefaultCmdTimeoutSec
   )
+  $stdoutPath = Join-Path $env:TEMP ('glow_vscode_out_' + [System.IO.Path]::GetRandomFileName())
+  $stderrPath = Join-Path $env:TEMP ('glow_vscode_err_' + [System.IO.Path]::GetRandomFileName())
   try {
-    $launchPath = $FilePath
-    $launchArgs = $ArgumentList
-    # Process.Start with UseShellExecute=false (required below for
-    # stdout/stderr redirection) does NOT consult the registry file
-    # association that lets ShellExecute run .cmd/.bat files directly -
-    # CreateProcess needs an actual executable. code.cmd (VS Code's CLI
-    # entry point on Windows) is a batch file, so it must be launched via
-    # cmd.exe /c, never passed as FileName directly.
-    if ($FilePath -match '\.(cmd|bat)$') {
-      $launchPath = Join-Path $env:SystemRoot 'System32\cmd.exe'
-      # /d skips any registry AutoRun commands - mild hardening for a
-      # script that may run as SYSTEM.
-      $launchArgs = @('/d', '/c', $FilePath) + $ArgumentList
-    }
+    $cmdExePath = Join-Path $env:SystemRoot 'System32\cmd.exe'
+    $innerCommand = (ConvertTo-VSCodeArgumentString (@($FilePath) + $ArgumentList)) +
+      ' > ' + (ConvertTo-VSCodeQuotedArgument $stdoutPath) +
+      ' 2> ' + (ConvertTo-VSCodeQuotedArgument $stderrPath)
 
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName = $launchPath
-    # .Arguments (a single pre-quoted string), not .ArgumentList.Add() -
-    # real bug found via a live windows-rtr run: .ArgumentList is $null
-    # under this box's Windows PowerShell 5.1 (real production RTR
-    # deployments run under plain `powershell.exe`, i.e. 5.1, not `pwsh` -
-    # this had gone uncaught because the windows-remote/SSH test path only
-    # ever exercised it under a bootstrapped pwsh 7, which a real target
-    # machine has no reason to have), throwing "You cannot call a method
-    # on a null-valued expression." on literally the first CLI call of any
-    # real deployment. ConvertTo-VSCodeArgumentString reproduces the same
-    # quoting ArgumentList would have applied, so this is not a behavior
-    # change on hosts where ArgumentList did work.
-    $psi.Arguments = ConvertTo-VSCodeArgumentString $launchArgs
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError  = $true
+    $psi.FileName = $cmdExePath
+    # /d skips any registry AutoRun commands - mild hardening for a
+    # script that may run as SYSTEM. The whole inner command is wrapped
+    # in ONE EXTRA outer pair of quotes deliberately - not redundant.
+    # cmd.exe's own /c quote-handling rule: if the remainder of the
+    # command line after /c contains more than exactly two quote
+    # characters, and its first character is a quote, cmd strips only
+    # the FIRST and LAST quote character in the ENTIRE remainder before
+    # executing it. $innerCommand already contains multiple quoted
+    # tokens (the exe path, each argument that needs it, both temp file
+    # paths) - without this extra wrap, that stripping rule would eat
+    # the first token's OPENING quote and the last token's CLOSING
+    # quote, corrupting both. Wrapping the whole thing in one more pair
+    # makes cmd strip exactly that outer wrapper instead, leaving every
+    # inner quote untouched - the standard, documented workaround for
+    # this exact cmd.exe quoting trap.
+    #
+    # FIX (real-run): .Arguments (a single pre-quoted string), not
+    # .ArgumentList.Add() - real bug found via a live windows-rtr run:
+    # .ArgumentList is $null under this box's Windows PowerShell 5.1
+    # (real production RTR deployments run under plain `powershell.exe`,
+    # i.e. 5.1, not `pwsh` - this had gone uncaught because the
+    # windows-remote/SSH test path only ever exercised it under a
+    # bootstrapped pwsh 7, which a real target machine has no reason to
+    # have), throwing "You cannot call a method on a null-valued
+    # expression." on literally the first CLI call of any real
+    # deployment. ConvertTo-VSCodeArgumentString/ConvertTo-VSCodeQuotedArgument
+    # reproduce the same quoting ArgumentList would have applied, so this
+    # is not a behavior change on hosts where ArgumentList did work.
+    $psi.Arguments = '/d /c "' + $innerCommand + '"'
+    $psi.RedirectStandardOutput = $false
+    $psi.RedirectStandardError  = $false
     $psi.UseShellExecute        = $false
     $psi.CreateNoWindow         = $true
 
     $proc = [System.Diagnostics.Process]::new()
     $proc.StartInfo = $psi
-
-    $outText = New-Object System.Text.StringBuilder
-    Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -Action {
-      if ($null -ne $EventArgs.Data) { $Event.MessageData.AppendLine($EventArgs.Data) | Out-Null }
-    } -MessageData $outText | Out-Null
-    Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -Action {
-      if ($null -ne $EventArgs.Data) { $Event.MessageData.AppendLine($EventArgs.Data) | Out-Null }
-    } -MessageData $outText | Out-Null
-
     $proc.Start() | Out-Null
-    $proc.BeginOutputReadLine()
-    $proc.BeginErrorReadLine()
 
     $exited = $proc.WaitForExit($TimeoutSec * 1000)
     if (-not $exited) {
-      # Process.Kill($true) (kills the entire child-process tree) is a
-      # .NET Core/.NET 5+-only overload - it does not exist under real
+      # FIX (real-run): Process.Kill($true) (kills the entire
+      # child-process tree) is a .NET Core/.NET 5+-only overload - it does not exist under real
       # RTR's actual runtime (powershell.exe 5.1, .NET Framework), where
       # calling it throws a MethodException that the bare catch below
       # used to silently swallow - meaning a timed-out process was NEVER
       # actually killed on real RTR, just left running forever.
       #
-      # The correct fallback is NOT a plain single-process Kill() - code.cmd
-      # is always launched via cmd.exe /d /c (see $launchPath above), so
-      # $proc here is that cmd.exe wrapper, not the real work. Confirmed
-      # directly: killing just the wrapper leaves its own children (the
-      # console host AND the actual long-running process, e.g. a real
-      # hung `code` invocation) still running indefinitely - an orphan,
-      # not a fix. taskkill /T /F recursively kills the whole tree by pid
-      # and is available on every Windows PowerShell version since it
-      # shells out to a separate, always-present executable rather than
-      # relying on any particular Process API surface.
+      # The correct fallback is NOT a plain single-process Kill() - the
+      # target is always launched via cmd.exe /d /c (see $psi.FileName
+      # above), so $proc here is that cmd.exe wrapper, not the real work.
+      # Confirmed directly: killing just the wrapper leaves its own
+      # children (the console host AND the actual long-running process,
+      # e.g. a real hung `code` invocation) still running indefinitely -
+      # an orphan, not a fix. taskkill /T /F recursively kills the whole
+      # tree by pid and is available on every Windows PowerShell version
+      # since it shells out to a separate, always-present executable
+      # rather than relying on any particular Process API surface.
       try {
         $proc.Kill($true)
       } catch {
@@ -685,18 +864,22 @@ function Invoke-VSCodeNativeCommand {
           try { $proc.Kill() } catch {}
         }
       }
+      $proc.WaitForExit()
     }
-    # Per .NET's own guidance for redirected-stream processes: call the
-    # parameterless overload after the timed one so the async output pump
-    # is guaranteed to finish flushing before Stdout/Stderr are read below -
-    # otherwise the last chunk of output can race the read.
-    $proc.WaitForExit()
-    Get-EventSubscriber | Where-Object { $_.SourceObject -eq $proc } | Unregister-Event
 
-    $combined = $outText.ToString()
-    return [PSCustomObject]@{ ExitCode = $proc.ExitCode; Stdout = $combined; Stderr = $combined }
+    $exitCode = $proc.ExitCode
+    $stdout = if (Test-VSCodeFileExists $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue } else { $null }
+    $stderr = if (Test-VSCodeFileExists $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue } else { $null }
+    return [PSCustomObject]@{
+      ExitCode = $exitCode
+      Stdout   = if ($stdout) { $stdout } else { '' }
+      Stderr   = if ($stderr) { $stderr } else { '' }
+    }
   } catch {
     return [PSCustomObject]@{ ExitCode = -1; Stdout = ''; Stderr = [string]$_ }
+  } finally {
+    Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
   }
 }
 
@@ -857,7 +1040,7 @@ function Enable-VSCodeSignatureVerificationBypass {
   param([string]$UserDataDir)
   $settingsDir = Join-Path $UserDataDir 'User'
   $settingsPath = Join-Path $settingsDir 'settings.json'
-  $backupPath = "$settingsPath.rwcbak"
+  $backupPath = "$settingsPath.glow-bak"
   $fileExisted = Test-VSCodeFileExists $settingsPath
   $originalRaw = if ($fileExisted) { Get-VSCodeFileContent $settingsPath } else { $null }
 
@@ -887,11 +1070,31 @@ function Enable-VSCodeSignatureVerificationBypass {
   # protect; Set-VSCodeFileContent's own atomic write means this can't
   # itself leave a half-written backup either.
   if ($fileExisted) {
+    # Capture the ORIGINAL file's own permissions BEFORE writing the
+    # backup, then explicitly reapply them to the backup afterward -
+    # never trust whatever ACL the backup write happens to inherit from
+    # the destination folder. Real bug hit once: a plain file copy
+    # silently picked up the destination folder's permissions instead of
+    # the source file's, so a locked-down config came back
+    # world-readable as a "backup".
+    $originalAcl = Get-VSCodeFileAcl $settingsPath
     Set-VSCodeFileContent $backupPath $originalRaw
+    Set-VSCodeFileAcl $backupPath $originalAcl
   }
 
   $settings['extensions.verifySignature'] = $false
   Set-VSCodeFileContent $settingsPath ($settings | ConvertTo-Json -Depth 10)
+
+  # Emergency restore, belt-and-suspenders on top of Set-VSCodeFileContent's
+  # own internal netbak-based restore: if the write above somehow still
+  # left $settingsPath missing (its own internal restore attempt also
+  # failed), fall back to the semantic .glow-bak backup captured just
+  # above, before Restore-VSCodeSignatureVerification's own cleanup ever
+  # gets a chance to delete it.
+  if ($fileExisted -and -not (Test-VSCodeFileExists $settingsPath) -and (Test-VSCodeFileExists $backupPath)) {
+    Write-VSCodeDiag "WARN: ${settingsPath} missing after signature-bypass write - restoring from ${backupPath}"
+    Copy-Item -LiteralPath $backupPath -Destination $settingsPath -Force -ErrorAction SilentlyContinue
+  }
 
   return [PSCustomObject]@{
     Applied      = $true
@@ -911,12 +1114,21 @@ function Restore-VSCodeSignatureVerification {
       # that matters.
       $originalRaw = Get-VSCodeFileContent $State.BackupPath
       Set-VSCodeFileContent $State.SettingsPath $originalRaw
+      if (-not (Test-VSCodeFileExists $State.SettingsPath) -and (Test-VSCodeFileExists $State.BackupPath)) {
+        Write-VSCodeDiag "WARN: $($State.SettingsPath) missing after restore write - copying backup back directly"
+        Copy-Item -LiteralPath $State.BackupPath -Destination $State.SettingsPath -Force -ErrorAction SilentlyContinue
+      }
     } else {
       Remove-VSCodeFileIfExists $State.SettingsPath
     }
-    Remove-VSCodeFileIfExists $State.BackupPath
   } catch {
     Write-VSCodeDiag "WARN: could not restore settings.json at $($State.SettingsPath) from backup $($State.BackupPath): $_"
+  } finally {
+    # Unconditional - success AND failure - not just the try block's own
+    # happy path: this backup can carry the file's PRIOR content
+    # (potentially secrets), so a stranded copy left behind by a failed
+    # restore is a real exposure, not just clutter.
+    Remove-VSCodeFileIfExists $State.BackupPath
   }
 }
 
@@ -1198,10 +1410,17 @@ function Get-VSCodeProp {
   return $prop.Value
 }
 
+# Strict dry_run cast: a real bool passes through as-is; of strings, ONLY
+# the exact lowercase literal "true" counts as true - everything else
+# (including "True", "TRUE", "1", "yes") falls to $Default. -ceq
+# (case-sensitive), not -eq, which is case-insensitive by default and
+# would wrongly accept "True" - a caller who intends a safe dry-run test
+# but supplies a case-mismatched string should NOT accidentally trigger a
+# real run.
 function ConvertTo-VSCodeBool {
   param($Value, [bool]$Default)
   if ($Value -is [bool]) { return $Value }
-  if ($Value -is [string]) { return $Value -eq 'true' }
+  if ($Value -is [string]) { return $Value -ceq 'true' }
   return $Default
 }
 
@@ -1229,13 +1448,18 @@ function ConvertTo-VSCodeCliResultJson {
   }
 }
 
+# Canonical envelope/target-level error shape is exactly {code, message} -
+# no stderr key. That field used to be standard fleet-wide, was
+# deprecated, and is kept only as an always-empty legacy field in scripts
+# that shipped before the deprecation - never add it to a new or touched
+# script. A target's own raw subprocess output (cli_result.stderr) is a
+# separate, unrelated field and is unaffected by this rule.
 function ConvertTo-VSCodeErrorJson {
   param($ErrorResult)
   if (-not $ErrorResult) { return $null }
   return [PSCustomObject]@{
     code    = $ErrorResult.Code
     message = $ErrorResult.Message
-    stderr  = $ErrorResult.Stderr
   }
 }
 
@@ -1258,6 +1482,85 @@ function Test-VSCodeUsedSystemFallback {
   return -not (($null -ne $TargetUser.User) -and ($null -eq $TargetUser.ResolutionNote))
 }
 
+# Builds one target object - the same shape whether this run is being
+# reported as a success/skip (via Get-VSCodeRunOutcome's Status/Changed/
+# Error) or as a hard failure that never got that far (Status is forced
+# to 'failure' by the caller in that case). Single seam so a field added
+# here can't get forgotten on only one of the two envelope-building call
+# sites below.
+function New-VSCodeTarget {
+  param(
+    [string]$ExtId,
+    [string]$DesiredVersion,
+    [string]$ExtensionPath,
+    [string]$Status,
+    [bool]$Changed,
+    [PSCustomObject]$Error,
+    [PSCustomObject]$Decision,
+    [string]$InstalledVersionAfter,
+    [PSCustomObject]$TargetUser,
+    $Action,
+    [bool]$VscodeRestarted
+  )
+  return [PSCustomObject]@{
+    extension_id            = $ExtId
+    desired_version          = $DesiredVersion
+    extension_path           = $ExtensionPath
+    action                   = $Decision.Action
+    status                   = $Status
+    changed                  = $Changed
+    error                    = (ConvertTo-VSCodeErrorJson $Error)
+    installed_version_before = $Decision.InstalledVersion
+    installed_version_after  = $InstalledVersionAfter
+    target_user              = $TargetUser.User
+    used_system_fallback     = (Test-VSCodeUsedSystemFallback $TargetUser)
+    user_resolution_note     = $TargetUser.ResolutionNote
+    cli_result               = (ConvertTo-VSCodeCliResultJson $Action)
+    vscode_restarted         = $VscodeRestarted
+  }
+}
+
+# Envelope shape, per glow-template's docs/reference/contract-standards.md
+# (base envelope: os_family, script_version, status, changed, error,
+# start_time, end_time, metadata - mandatory on every script) plus
+# docs/reference/uniformity-conventions.md's upgrade-family extension: a
+# top-level scope ('anchor'|'fleet') sibling and a targets[] array, even
+# for exactly one target, so a downstream parser never special-cases "one
+# target" vs "many". The base fields are NOT replaced by scope/targets[] -
+# both are present. This script only ever targets one extension per
+# invocation (no fleet-sweep concept here), so scope is always "anchor",
+# targets is always a single-element array, and the envelope-level
+# status/changed/error simply mirror that one target's own (kept as
+# separate fields, not references, since a script that ever grows real
+# multi-target sweeps would need to aggregate them instead).
+function New-VSCodeEnvelope {
+  param(
+    [string]$StartTime,
+    [bool]$DryRun,
+    [PSCustomObject]$Target,
+    $OsMajor = $null
+  )
+  $envelope = [PSCustomObject]@{
+    os_family        = $Script:OsFamily
+    script_version   = $Script:ScriptVersion
+    status           = $Target.status
+    changed          = $Target.changed
+    error            = $Target.error
+    scope            = 'anchor'
+    targets          = @($Target)
+    dry_run          = $DryRun
+    start_time       = $StartTime
+    end_time         = (Get-VSCodeNowIso)
+    metadata         = [PSCustomObject]@{ hostname = $env:COMPUTERNAME; serial_number = (Get-VSCodeSerialNumber) }
+    os_major_version = $OsMajor
+  }
+  # Explicit -Depth, minimum 12 per fleet convention - ConvertTo-Json's
+  # default depth (2) silently truncates anything nested deeper with no
+  # warning; this envelope alone (metadata -> ..., targets[].cli_result
+  # -> ...) already exceeds that default.
+  return ($envelope | ConvertTo-Json -Compress -Depth 12)
+}
+
 function New-VSCodeFailureEnvelope {
   param(
     [string]$StartTime,
@@ -1273,7 +1576,7 @@ function New-VSCodeFailureEnvelope {
     # which is what makes "whatever was already figured out" available
     # at every one of this function's call sites, early or late.
     [string]$ExtId = $null,
-    [string]$TargetVersion = $null,
+    [string]$DesiredVersion = $null,
     [string]$ExtensionPath = $null,
     [PSCustomObject]$TargetUser = [PSCustomObject]@{ User = $null; ExtensionsDir = $null; ResolutionNote = $null },
     $OsMajor = $null,
@@ -1283,30 +1586,11 @@ function New-VSCodeFailureEnvelope {
     [bool]$VscodeRestarted = $false
   )
   Write-VSCodeDiag "ERROR: ${Code}: $Message"
-  $envelope = [PSCustomObject]@{
-    os_family                = $Script:OsFamily
-    script_version           = $Script:ScriptVersion
-    status                   = 'failure'
-    changed                  = $false
-    error                    = [PSCustomObject]@{ code = $Code; message = $Message; stderr = '' }
-    dry_run                  = $DryRun
-    start_time                = $StartTime
-    end_time                  = (Get-VSCodeNowIso)
-    metadata                  = [PSCustomObject]@{ hostname = $env:COMPUTERNAME; serial_number = (Get-VSCodeSerialNumber) }
-    extension_id               = $ExtId
-    target_version             = $TargetVersion
-    extension_path             = $ExtensionPath
-    action                     = $Decision.Action
-    installed_version_before   = $Decision.InstalledVersion
-    installed_version_after    = $InstalledVersionAfter
-    target_user                = $TargetUser.User
-    used_system_fallback       = (Test-VSCodeUsedSystemFallback $TargetUser)
-    user_resolution_note       = $TargetUser.ResolutionNote
-    os_major_version           = $OsMajor
-    cli_result                 = (ConvertTo-VSCodeCliResultJson $Action)
-    vscode_restarted            = $VscodeRestarted
-  }
-  return ($envelope | ConvertTo-Json -Compress -Depth 6)
+  $target = New-VSCodeTarget -ExtId $ExtId -DesiredVersion $DesiredVersion -ExtensionPath $ExtensionPath `
+    -Status 'failure' -Changed $false -Error ([PSCustomObject]@{ Code = $Code; Message = $Message }) `
+    -Decision $Decision -InstalledVersionAfter $InstalledVersionAfter -TargetUser $TargetUser `
+    -Action $Action -VscodeRestarted $VscodeRestarted
+  return New-VSCodeEnvelope -StartTime $StartTime -DryRun $DryRun -Target $target -OsMajor $OsMajor
 }
 
 function Invoke-SetVSCodeExtensionVersion {
@@ -1322,7 +1606,7 @@ function Invoke-SetVSCodeExtensionVersion {
   # declared in this scope, as the try block below does, does not
   # shadow it. See New-VSCodeFailureEnvelope's own comment.
   $extId = $null
-  $targetVersion = $null
+  $desiredVersion = $null
   $extensionPath = $null
   $targetUser = [PSCustomObject]@{ User = $null; ExtensionsDir = $null; ResolutionNote = $null }
   $osMajor = $null
@@ -1347,10 +1631,10 @@ function Invoke-SetVSCodeExtensionVersion {
       return New-VSCodeFailureEnvelope $startTime $dryRun 'INVALID_PARAMS' 'invalid or missing extension_id (expected "<publisher>.<name>")' -ExtId $extId
     }
 
-    $targetVersion = Get-VSCodeProp $params 'version' $null
-    if ($null -ne $targetVersion) { $targetVersion = [string]$targetVersion }
-    if (-not (Test-VSCodeExtensionVersion $targetVersion)) {
-      return New-VSCodeFailureEnvelope $startTime $dryRun 'INVALID_PARAMS' "invalid version: $targetVersion" -ExtId $extId -TargetVersion $targetVersion
+    $desiredVersion = Get-VSCodeProp $params 'desired_version' $null
+    if ($null -ne $desiredVersion) { $desiredVersion = [string]$desiredVersion }
+    if (-not (Test-VSCodeExtensionVersion $desiredVersion)) {
+      return New-VSCodeFailureEnvelope $startTime $dryRun 'INVALID_PARAMS' "invalid desired_version: $desiredVersion" -ExtId $extId -DesiredVersion $desiredVersion
     }
 
     $extensionPath = Get-VSCodeProp $params 'extension_path' $null
@@ -1358,8 +1642,11 @@ function Invoke-SetVSCodeExtensionVersion {
 
     $codePath = Find-VSCodeCli -TargetUser $targetUser.User
     if (-not $codePath) {
-      return New-VSCodeFailureEnvelope $startTime $dryRun 'VSCODE_NOT_INSTALLED' 'code.cmd was not found in any known install location' `
-        -ExtId $extId -TargetVersion $targetVersion -ExtensionPath $extensionPath -TargetUser $targetUser
+      # CLI_NOT_FOUND, not a script-local code: the required CLI binary
+      # could not be resolved by absolute path - see
+      # glow-template's docs/reference/uniformity-conventions.md registered error-code list.
+      return New-VSCodeFailureEnvelope $startTime $dryRun 'CLI_NOT_FOUND' 'code.cmd was not found in any known install location' `
+        -ExtId $extId -DesiredVersion $desiredVersion -ExtensionPath $extensionPath -TargetUser $targetUser
     }
 
     $osMajor = Get-VSCodeOSMajorVersion
@@ -1367,11 +1654,18 @@ function Invoke-SetVSCodeExtensionVersion {
     $listResult = Get-VSCodeInstalledExtensionsRaw $codePath $targetUser.ExtensionsDir
     if ($listResult.ExitCode -ne 0) {
       $rawMsg = if ($listResult.Stderr) { $listResult.Stderr } elseif ($listResult.Stdout) { $listResult.Stdout } else { '' }
-      return New-VSCodeFailureEnvelope $startTime $dryRun 'LIST_EXTENSIONS_FAILED' "code --list-extensions failed: $($rawMsg.Trim())" `
-        -ExtId $extId -TargetVersion $targetVersion -ExtensionPath $extensionPath -TargetUser $targetUser -OsMajor $osMajor
+      # UPGRADE_INCOMPLETE, not a script-local LIST_EXTENSIONS_FAILED: the
+      # CLI ran and failed with no more specific classification available
+      # - same failure shape as a failed --install-extension call, per
+      # glow-template's docs/reference/uniformity-conventions.md registered error-code list. The raw CLI
+      # output stays in the message text (not dropped) so this is still
+      # distinguishable from an install/upgrade failure by message even
+      # though the code is shared.
+      return New-VSCodeFailureEnvelope $startTime $dryRun 'UPGRADE_INCOMPLETE' "code --list-extensions failed: $($rawMsg.Trim())" `
+        -ExtId $extId -DesiredVersion $desiredVersion -ExtensionPath $extensionPath -TargetUser $targetUser -OsMajor $osMajor
     }
     $installedBefore = ConvertFrom-VSCodeInstalledExtensionsList $listResult.Stdout
-    $decision = Get-VSCodeVersionAction $installedBefore $extId $targetVersion
+    $decision = Get-VSCodeVersionAction $installedBefore $extId $desiredVersion
 
     $action = $null
     $installedVersionAfter = $decision.InstalledVersion
@@ -1379,7 +1673,7 @@ function Invoke-SetVSCodeExtensionVersion {
     switch ($decision.Action) {
       'not_installed'           { } # per spec: never install fresh
       'already_correct_version' { } # idempotent no-op
-      'set_version'              { $action = Invoke-VSCodeSetExactVersion $codePath $targetUser.ExtensionsDir $extId $targetVersion $dryRun }
+      'set_version'              { $action = Invoke-VSCodeSetExactVersion $codePath $targetUser.ExtensionsDir $extId $desiredVersion $dryRun }
       'upgrade_to_latest'        { $action = Invoke-VSCodeUpgradeToLatest $codePath $targetUser.ExtensionsDir $extId $dryRun }
     }
 
@@ -1406,42 +1700,23 @@ function Invoke-SetVSCodeExtensionVersion {
       }
     }
 
-    $envelope = [PSCustomObject]@{
-      os_family                = $Script:OsFamily
-      script_version           = $Script:ScriptVersion
-      status                   = $outcome.Status
-      changed                  = $outcome.Changed
-      error                    = (ConvertTo-VSCodeErrorJson $outcome.Error)
-      dry_run                  = $dryRun
-      start_time                = $startTime
-      end_time                  = (Get-VSCodeNowIso)
-      metadata                  = [PSCustomObject]@{ hostname = $env:COMPUTERNAME; serial_number = (Get-VSCodeSerialNumber) }
-      extension_id               = $extId
-      target_version             = $targetVersion
-      extension_path             = $extensionPath
-      action                     = $decision.Action
-      installed_version_before   = $decision.InstalledVersion
-      installed_version_after    = $installedVersionAfter
-      target_user                = $targetUser.User
-      # Named distinctly from the macOS side's own `ran_as_root` field -
-      # Windows always runs under SYSTEM here (RTR has no equivalent of
-      # mac's `launchctl asuser` impersonation), so "ran as root" was
-      # never actually true; this is really "user resolution failed and
-      # we fell back to SYSTEM's own isolated extensions dir instead of
-      # a resolved user's profile" (see Resolve-VSCodeTargetUser).
-      used_system_fallback       = (Test-VSCodeUsedSystemFallback $targetUser)
-      user_resolution_note       = $targetUser.ResolutionNote
-      os_major_version           = $osMajor
-      cli_result                 = (ConvertTo-VSCodeCliResultJson $action)
-      vscode_restarted            = $vscodeRestarted
-    }
+    # Named distinctly from the macOS side's own `ran_as_root` field -
+    # Windows always runs under SYSTEM here (RTR has no equivalent of
+    # mac's `launchctl asuser` impersonation), so "ran as root" was never
+    # actually true; this is really "user resolution failed and we fell
+    # back to SYSTEM's own isolated extensions dir instead of a resolved
+    # user's profile" (see Resolve-VSCodeTargetUser).
+    $target = New-VSCodeTarget -ExtId $extId -DesiredVersion $desiredVersion -ExtensionPath $extensionPath `
+      -Status $outcome.Status -Changed $outcome.Changed -Error $outcome.Error -Decision $decision `
+      -InstalledVersionAfter $installedVersionAfter -TargetUser $targetUser -Action $action `
+      -VscodeRestarted $vscodeRestarted
 
-    $json = $envelope | ConvertTo-Json -Compress -Depth 6
+    $json = New-VSCodeEnvelope -StartTime $startTime -DryRun $dryRun -Target $target -OsMajor $osMajor
     Write-VSCodeDiag "RESULT: $json"
     return $json
   } catch {
     return New-VSCodeFailureEnvelope $startTime $dryRun 'UNHANDLED_ERROR' $_.Exception.Message `
-      -ExtId $extId -TargetVersion $targetVersion -ExtensionPath $extensionPath -TargetUser $targetUser `
+      -ExtId $extId -DesiredVersion $desiredVersion -ExtensionPath $extensionPath -TargetUser $targetUser `
       -OsMajor $osMajor -Decision $decision -Action $action -InstalledVersionAfter $installedVersionAfter `
       -VscodeRestarted $vscodeRestarted
   }

@@ -49,7 +49,7 @@
 //   - Diag   : file-only at /tmp/glow/rtr.txt. Never stderr.
 //
 // Local testing (no args uses safe defaults: dry_run=true):
-//   INPUT=$(printf '%s' '{"params":{"extension_id":"ms-python.python","version":"2024.1.0","extension_path":"/Users/jdoe/.vscode/extensions/ms-python.python-2024.5.0"},"dry_run":true}' | base64)
+//   INPUT=$(printf '%s' '{"params":{"extension_id":"ms-python.python","desired_version":"2024.1.0","extension_path":"/Users/jdoe/.vscode/extensions/ms-python.python-2024.5.0"},"dry_run":true}' | base64)
 //   sudo osascript -l JavaScript set-vscode-extension-version.js "$INPUT"
 // =====================================================================
 
@@ -394,7 +394,7 @@ function getSettingsPath(uid, user) {
 function enableSignatureBypass(settingsPath, uid) {
   var fileExisted = fileExists(settingsPath);
   var originalRaw = fileExisted ? readFileRaw(settingsPath) : null;
-  var backupPath = settingsPath + '.rwcbak';
+  var backupPath = settingsPath + '.glow-bak';
 
   // Parse BEFORE writing anything - an unparseable existing file must
   // leave the real filesystem completely untouched (not even a backup
@@ -675,6 +675,59 @@ function castBool(v, dflt) {
   return dflt;
 }
 
+// Builds one target object - the same shape whether this run is being
+// reported as a success/skip or a hard failure that never got that far
+// (opts.status is forced to 'failure' by the caller in that case). Single
+// seam so a field added here can't get forgotten on only one of the two
+// envelope-building call sites in run() below.
+function buildTarget(opts) {
+  return {
+    extension_id:             opts.extId,
+    desired_version:          opts.desiredVersion,
+    extension_path:           opts.extensionPath,
+    action:                   opts.decision.action,
+    status:                   opts.status,
+    changed:                  opts.changed,
+    error:                    opts.error || null,
+    installed_version_before: opts.decision.installedVersion || null,
+    installed_version_after:  opts.installedVersionAfter,
+    target_user:              opts.targetUser.user,
+    ran_as_root:              opts.targetUser.uid === null,
+    user_resolution_note:     opts.targetUser.resolution_note,
+    cli_result:               opts.actionResult,
+    vscode_restarted:         opts.vscodeRestarted,
+  };
+}
+
+// Envelope shape: upgrade-family scripts (bump a version rather than
+// remove something) wrap the result in targets[] + a top-level scope,
+// even for exactly one target (glow-template docs/reference/
+// uniformity-conventions.md's upgrade-family scope/targets[] convention) -
+// AND still carry the base envelope's own status/changed/error at the
+// root too (glow-template docs/reference/contract-standards.md - every
+// script must satisfy the base envelope, scope/targets[] is additive, not
+// a replacement). This script only ever targets one extension per
+// invocation (no fleet-sweep concept here), so scope is always "anchor"
+// and targets is always a single-element array, and the envelope-level
+// status/changed/error simply mirror that one target's own.
+function buildEnvelope(opts) {
+  var target = buildTarget(opts);
+  return {
+    os_family:        OS_FAMILY,
+    script_version:   SCRIPT_VERSION,
+    status:           target.status,
+    changed:          target.changed,
+    error:            target.error,
+    scope:            'anchor',
+    targets:          [target],
+    dry_run:          opts.dryRun,
+    start_time:       opts.startTime,
+    end_time:         nowIso(),
+    metadata:         { hostname: hostname(), serial_number: serialNumber() },
+    os_major_version: opts.osMajor,
+  };
+}
+
 function run(argv) {
   var startTime = nowIso();
   var dryRun    = true; // safe default for bare local invocation
@@ -689,7 +742,7 @@ function run(argv) {
   // inside the try block further down is legal JS and just reassigns
   // these same function-scoped bindings, it does not shadow them.
   var extId = null;
-  var targetVersion = null;
+  var desiredVersion = null;
   var extensionPath = null;
   var targetUser = { user: null, uid: null, resolution_note: null };
   var osMajor = null;
@@ -724,14 +777,18 @@ function run(argv) {
       throw { code: 'INVALID_PARAMS', message: 'invalid or missing extension_id (expected "<publisher>.<name>")' };
     }
 
-    var targetVersion = getProp(params, 'version', null);
-    if (targetVersion != null) targetVersion = String(targetVersion);
-    if (!validateVersion(targetVersion)) {
-      throw { code: 'INVALID_PARAMS', message: 'invalid version: ' + targetVersion };
+    var desiredVersion = getProp(params, 'desired_version', null);
+    if (desiredVersion != null) desiredVersion = String(desiredVersion);
+    if (!validateVersion(desiredVersion)) {
+      throw { code: 'INVALID_PARAMS', message: 'invalid desired_version: ' + desiredVersion };
     }
 
     if (!fileExists(VSCODE.codePath)) {
-      throw { code: 'VSCODE_NOT_INSTALLED', message: 'VS Code is not installed at ' + VSCODE.codePath };
+      // CLI_NOT_FOUND, not a script-local code: the required CLI binary
+      // could not be resolved by absolute path - see glow-template
+      // docs/reference/uniformity-conventions.md's registered error-code
+      // list.
+      throw { code: 'CLI_NOT_FOUND', message: 'VS Code is not installed at ' + VSCODE.codePath };
     }
 
     var extensionPath = getProp(params, 'extension_path', null);
@@ -744,13 +801,20 @@ function run(argv) {
     var listResult = listInstalledExtensions(targetUser.uid, targetUser.user);
     writeDiag('run(): code --list-extensions (first call) returned exitCode=' + listResult.exitCode);
     if (listResult.exitCode !== 0) {
+      // UPGRADE_INCOMPLETE, not a script-local LIST_EXTENSIONS_FAILED:
+      // the CLI ran and failed with no more specific classification
+      // available - same failure shape as a failed --install-extension
+      // call, per glow-template's registered error-code list. The raw
+      // CLI output stays in the message text (not dropped), so this is
+      // still distinguishable from an install/upgrade failure by message
+      // even though the code is shared.
       throw {
-        code: 'LIST_EXTENSIONS_FAILED',
+        code: 'UPGRADE_INCOMPLETE',
         message: 'code --list-extensions failed: ' + (listResult.stderr || listResult.stdout || '').trim(),
       };
     }
     var installedBefore = parseInstalledExtensionsList(listResult.stdout);
-    var decision = decideVersionAction(installedBefore, extId, targetVersion);
+    var decision = decideVersionAction(installedBefore, extId, desiredVersion);
     writeDiag('run(): decision.action=' + decision.action + ' installedVersion=' + decision.installedVersion);
 
     var action = null;
@@ -761,8 +825,8 @@ function run(argv) {
     } else if (decision.action === 'already_correct_version') {
       // Idempotent no-op.
     } else if (decision.action === 'set_version') {
-      writeDiag('run(): calling setExactVersion(' + extId + '@' + targetVersion + ')');
-      action = setExactVersion(targetUser.uid, targetUser.user, extId, targetVersion, dryRun);
+      writeDiag('run(): calling setExactVersion(' + extId + '@' + desiredVersion + ')');
+      action = setExactVersion(targetUser.uid, targetUser.user, extId, desiredVersion, dryRun);
       writeDiag('run(): setExactVersion returned ok=' + (action && action.ok));
     } else if (decision.action === 'upgrade_to_latest') {
       writeDiag('run(): calling upgradeToLatest(' + extId + ')');
@@ -798,61 +862,30 @@ function run(argv) {
     }
     writeDiag('run(): about to build envelope and return');
 
-    envelope = {
-      os_family:                OS_FAMILY,
-      script_version:           SCRIPT_VERSION,
-      status:                   outcome.status,
-      changed:                  outcome.changed,
-      error:                    outcome.error,
-      dry_run:                  dryRun,
-      start_time:               startTime,
-      end_time:                 nowIso(),
-      metadata:                 { hostname: hostname(), serial_number: serialNumber() },
-      extension_id:             extId,
-      target_version:           targetVersion,
-      extension_path:           extensionPath,
-      action:                   decision.action,
-      installed_version_before: decision.installedVersion || null,
-      installed_version_after:  installedVersionAfter,
-      target_user:              targetUser.user,
-      ran_as_root:              targetUser.uid === null,
-      user_resolution_note:     targetUser.resolution_note,
-      os_major_version:         osMajor,
-      cli_result:               action,
-      vscode_restarted:         vscodeRestarted,
-    };
+    envelope = buildEnvelope({
+      startTime: startTime, dryRun: dryRun,
+      extId: extId, desiredVersion: desiredVersion, extensionPath: extensionPath,
+      decision: decision, status: outcome.status, changed: outcome.changed, error: outcome.error,
+      installedVersionAfter: installedVersionAfter, targetUser: targetUser, osMajor: osMajor,
+      actionResult: action, vscodeRestarted: vscodeRestarted,
+    });
   } catch (e) {
     var code = (e && e.code)    ? e.code    : 'UNHANDLED_ERROR';
     var msg  = (e && e.message) ? e.message : String(e);
     writeDiag('ERROR: ' + code + ': ' + msg);
-    envelope = {
-      os_family:                OS_FAMILY,
-      script_version:           SCRIPT_VERSION,
-      status:                   'failure',
-      changed:                  false,
-      error:                    { code: code, message: msg, stderr: '' },
-      dry_run:                  dryRun,
-      start_time:               startTime,
-      end_time:                 nowIso(),
-      metadata:                 { hostname: hostname(), serial_number: serialNumber() },
-      // Mirrors the success envelope's own full field list - whatever of
-      // these was already figured out before the failure (see the `var`
-      // declarations at the top of this function) is reported as-is;
-      // anything not yet reached stays at its safe default instead of
-      // just being absent from a differently-shaped object.
-      extension_id:             extId,
-      target_version:           targetVersion,
-      extension_path:           extensionPath,
-      action:                   decision.action,
-      installed_version_before: decision.installedVersion || null,
-      installed_version_after:  installedVersionAfter,
-      target_user:              targetUser.user,
-      ran_as_root:              targetUser.uid === null,
-      user_resolution_note:     targetUser.resolution_note,
-      os_major_version:         osMajor,
-      cli_result:               action,
-      vscode_restarted:         vscodeRestarted,
-    };
+    // Mirrors the success envelope's own full field list - whatever of
+    // these was already figured out before the failure (see the `var`
+    // declarations at the top of this function) is reported as-is;
+    // anything not yet reached stays at its safe default instead of just
+    // being absent from a differently-shaped object. Canonical error
+    // shape is {code, message} only - no stderr key.
+    envelope = buildEnvelope({
+      startTime: startTime, dryRun: dryRun,
+      extId: extId, desiredVersion: desiredVersion, extensionPath: extensionPath,
+      decision: decision, status: 'failure', changed: false, error: { code: code, message: msg },
+      installedVersionAfter: installedVersionAfter, targetUser: targetUser, osMajor: osMajor,
+      actionResult: action, vscodeRestarted: vscodeRestarted,
+    });
   }
 
   var json = JSON.stringify(envelope);

@@ -346,12 +346,12 @@ test('runCode: brackets the call with the signature-verification bypass, enablin
   // bypassed settings.json, the restore (read back from that backup,
   // not from an in-memory variable), then the backup itself cleaned up.
   assertEqual(fileWriteLog.length, 4);
-  assertEqual(fileWriteLog[0].path, '/Users/jdoe/Library/Application Support/Code/User/settings.json.rwcbak');
+  assertEqual(fileWriteLog[0].path, '/Users/jdoe/Library/Application Support/Code/User/settings.json.glow-bak');
   assertEqual(fileWriteLog[0].content, '{"foo":"bar"}');
   assertEqual(fileWriteLog[1].path, '/Users/jdoe/Library/Application Support/Code/User/settings.json');
   assertTrue(JSON.parse(fileWriteLog[1].content)['extensions.verifySignature'] === false);
   assertEqual(fileWriteLog[2].content, '{"foo":"bar"}');
-  assertEqual(fileWriteLog[3].path, '/Users/jdoe/Library/Application Support/Code/User/settings.json.rwcbak');
+  assertEqual(fileWriteLog[3].path, '/Users/jdoe/Library/Application Support/Code/User/settings.json.glow-bak');
   assertEqual(fileWriteLog[3].content, null);
 });
 
@@ -399,8 +399,8 @@ test('enableSignatureBypass: existing settings.json -> preserves other keys, res
   // restoreSignatureVerification reads it back from the on-disk backup
   // instead (state.backupPath), not from memory - see that function's
   // own comment on why that matters.
-  assertEqual(state.backupPath, path + '.rwcbak');
-  assertEqual(fileWriteLog[0].path, path + '.rwcbak');
+  assertEqual(state.backupPath, path + '.glow-bak');
+  assertEqual(fileWriteLog[0].path, path + '.glow-bak');
   assertEqual(fileWriteLog[0].content, '{"editor.fontSize":14}');
   var written = JSON.parse(fileWriteLog[1].content);
   assertEqual(written['editor.fontSize'], 14);
@@ -408,7 +408,7 @@ test('enableSignatureBypass: existing settings.json -> preserves other keys, res
 
   restoreSignatureVerification(state);
   assertEqual(fileWriteLog[2].content, '{"editor.fontSize":14}');
-  assertEqual(fileWriteLog[3].path, path + '.rwcbak');
+  assertEqual(fileWriteLog[3].path, path + '.glow-bak');
   assertEqual(fileWriteLog[3].content, null);
 });
 
@@ -573,63 +573,76 @@ function withFileExists(fn, testFn) {
   }
 }
 
-test('run(): invalid extension_id -> failure envelope, INVALID_PARAMS', function () {
+test('run(): invalid extension_id -> failure envelope, INVALID_PARAMS, wrapped in scope/targets[], mirrored at envelope level', function () {
   var result = JSON.parse(run(makeArgv({ extension_id: 'not-an-id' }, true)));
-  assertEqual(result.status, 'failure');
-  assertEqual(result.error.code, 'INVALID_PARAMS');
-  // Failure envelopes mirror the success envelope's own full field list -
+  assertEqual(result.scope, 'anchor');
+  assertEqual(result.targets.length, 1);
+  var target = result.targets[0];
+  assertEqual(target.status, 'failure');
+  assertEqual(target.error.code, 'INVALID_PARAMS');
+  // Failure targets mirror the success target's own full field list -
   // whatever was already figured out before the failure (here, just the
   // raw invalid extension_id itself) is reported as-is; everything not
   // yet reached stays at its safe "not yet known" default rather than
   // just being absent, so a caller never has to special-case a failure
-  // envelope's shape vs. a success one's.
-  assertEqual(result.extension_id, 'not-an-id');
-  assertEqual(result.target_version, null);
-  assertEqual(result.extension_path, null);
-  assertEqual(result.action, null);
-  assertEqual(result.target_user, null);
-  assertEqual(result.ran_as_root, true);
-  assertEqual(result.cli_result, null);
-  assertEqual(result.vscode_restarted, false);
-});
-
-test('run(): invalid version -> failure envelope, INVALID_PARAMS', function () {
-  var result = JSON.parse(run(makeArgv({ extension_id: 'ms-python.python', version: 'not-semver' }, true)));
+  // target's shape vs. a success one's.
+  assertEqual(target.extension_id, 'not-an-id');
+  assertEqual(target.desired_version, null);
+  assertEqual(target.extension_path, null);
+  assertEqual(target.action, null);
+  assertEqual(target.target_user, null);
+  assertEqual(target.ran_as_root, true);
+  assertEqual(target.cli_result, null);
+  assertEqual(target.vscode_restarted, false);
+  // Base envelope fields (contract-standards.md) stay present ALONGSIDE
+  // scope/targets[], not replaced by them - mirroring the one target's
+  // own status/changed/error since this script only ever has one.
   assertEqual(result.status, 'failure');
+  assertEqual(result.changed, false);
   assertEqual(result.error.code, 'INVALID_PARAMS');
-  assertEqual(result.extension_id, 'ms-python.python');
-  assertEqual(result.target_version, 'not-semver');
 });
 
-test('run(): VS Code not installed -> failure envelope, VSCODE_NOT_INSTALLED', function () {
+test('run(): invalid desired_version -> failure envelope, INVALID_PARAMS', function () {
+  var result = JSON.parse(run(makeArgv({ extension_id: 'ms-python.python', desired_version: 'not-semver' }, true)));
+  var target = result.targets[0];
+  assertEqual(target.status, 'failure');
+  assertEqual(target.error.code, 'INVALID_PARAMS');
+  assertEqual(target.extension_id, 'ms-python.python');
+  assertEqual(target.desired_version, 'not-semver');
+});
+
+test('run(): VS Code not installed -> failure envelope, CLI_NOT_FOUND', function () {
   withFileExists(function () { return false; }, function () {
     var result = JSON.parse(run(makeArgv({ extension_id: 'ms-python.python', extension_path: JDOE_PATH }, true)));
-    assertEqual(result.status, 'failure');
-    assertEqual(result.error.code, 'VSCODE_NOT_INSTALLED');
+    var target = result.targets[0];
+    assertEqual(target.status, 'failure');
+    assertEqual(target.error.code, 'CLI_NOT_FOUND');
     // On mac this check fires before extension_path is even read (see
     // run()'s own ordering) - unlike Windows, which resolves the target
     // user first. Both still stay at their safe "not yet known"
     // defaults here rather than being absent from the envelope.
-    assertEqual(result.extension_id, 'ms-python.python');
-    assertEqual(result.extension_path, null);
-    assertEqual(result.target_user, null);
+    assertEqual(target.extension_id, 'ms-python.python');
+    assertEqual(target.extension_path, null);
+    assertEqual(target.target_user, null);
   });
 });
 
-test('run(): code --list-extensions itself fails -> failure envelope, LIST_EXTENSIONS_FAILED', function () {
+test('run(): code --list-extensions itself fails -> failure envelope, UPGRADE_INCOMPLETE with the raw CLI failure in the message', function () {
   withFileExists(function () { return true; }, function () {
     mockConfig.idUidByUser.jdoe = 501;
     mockConfig.listExtensionsExitCode = 1;
     var result = JSON.parse(run(makeArgv(
-      { extension_id: 'ms-python.python', version: '2024.1.0', extension_path: JDOE_PATH }, true,
+      { extension_id: 'ms-python.python', desired_version: '2024.1.0', extension_path: JDOE_PATH }, true,
     )));
-    assertEqual(result.status, 'failure');
-    assertEqual(result.error.code, 'LIST_EXTENSIONS_FAILED');
-    assertEqual(result.extension_id, 'ms-python.python');
-    assertEqual(result.target_version, '2024.1.0');
-    assertEqual(result.extension_path, JDOE_PATH);
-    assertEqual(result.target_user, 'jdoe');
-    assertEqual(result.ran_as_root, false);
+    var target = result.targets[0];
+    assertEqual(target.status, 'failure');
+    assertEqual(target.error.code, 'UPGRADE_INCOMPLETE');
+    assertTrue(target.error.message.indexOf('list-extensions') !== -1);
+    assertEqual(target.extension_id, 'ms-python.python');
+    assertEqual(target.desired_version, '2024.1.0');
+    assertEqual(target.extension_path, JDOE_PATH);
+    assertEqual(target.target_user, 'jdoe');
+    assertEqual(target.ran_as_root, false);
   });
 });
 
@@ -638,12 +651,13 @@ test('run(): extension not installed -> skipped, no CLI action taken', function 
     mockConfig.idUidByUser.jdoe = 501;
     mockConfig.listExtensionsStdout = 'some-other.extension@1.0.0\n';
     var result = JSON.parse(run(makeArgv(
-      { extension_id: 'ms-python.python', version: '2024.1.0', extension_path: JDOE_PATH }, true,
+      { extension_id: 'ms-python.python', desired_version: '2024.1.0', extension_path: JDOE_PATH }, true,
     )));
-    assertEqual(result.status, 'skipped');
-    assertEqual(result.changed, false);
-    assertEqual(result.action, 'not_installed');
-    assertEqual(result.cli_result, null);
+    var target = result.targets[0];
+    assertEqual(target.status, 'skipped');
+    assertEqual(target.changed, false);
+    assertEqual(target.action, 'not_installed');
+    assertEqual(target.cli_result, null);
   });
 });
 
@@ -652,10 +666,11 @@ test('run(): already at the target version -> skipped, no CLI action taken', fun
     mockConfig.idUidByUser.jdoe = 501;
     mockConfig.listExtensionsStdout = 'ms-python.python@2024.1.0\n';
     var result = JSON.parse(run(makeArgv(
-      { extension_id: 'ms-python.python', version: '2024.1.0', extension_path: JDOE_PATH }, true,
+      { extension_id: 'ms-python.python', desired_version: '2024.1.0', extension_path: JDOE_PATH }, true,
     )));
-    assertEqual(result.status, 'skipped');
-    assertEqual(result.action, 'already_correct_version');
+    var target = result.targets[0];
+    assertEqual(target.status, 'skipped');
+    assertEqual(target.action, 'already_correct_version');
   });
 });
 
@@ -671,17 +686,22 @@ test('run(): differing version, real run -> success, changed, version pin invoke
     mockConfig.installResult = { exitCode: 0, stdout: '', stderr: '' };
 
     var result = JSON.parse(run(makeArgv(
-      { extension_id: 'ms-python.python', version: '2024.5.0', extension_path: JDOE_PATH }, false,
+      { extension_id: 'ms-python.python', desired_version: '2024.5.0', extension_path: JDOE_PATH }, false,
     )));
-    assertEqual(result.status, 'success');
-    assertEqual(result.changed, true);
-    assertEqual(result.action, 'set_version');
-    assertEqual(result.installed_version_before, '2024.1.0');
-    assertEqual(result.installed_version_after, '2024.5.0');
-    assertTrue(result.cli_result.ok);
+    var target = result.targets[0];
+    assertEqual(target.status, 'success');
+    assertEqual(target.changed, true);
+    assertEqual(target.action, 'set_version');
+    assertEqual(target.installed_version_before, '2024.1.0');
+    assertEqual(target.installed_version_after, '2024.5.0');
+    assertTrue(target.cli_result.ok);
     // VS Code isn't "running" per the default mock (vscodeRunningSequence:
     // [false]) - nothing to restart, so this must stay false.
-    assertEqual(result.vscode_restarted, false);
+    assertEqual(target.vscode_restarted, false);
+    // Base envelope fields mirror the target on success too.
+    assertEqual(result.status, 'success');
+    assertEqual(result.changed, true);
+    assertEqual(result.error, null);
   });
 });
 
@@ -696,11 +716,12 @@ test('run(): differing version, real run, VS Code already running -> restarts it
     mockConfig.vscodeRunningSequence = [true, false];
 
     var result = JSON.parse(run(makeArgv(
-      { extension_id: 'ms-python.python', version: '2024.5.0', extension_path: JDOE_PATH }, false,
+      { extension_id: 'ms-python.python', desired_version: '2024.5.0', extension_path: JDOE_PATH }, false,
     )));
-    assertEqual(result.status, 'success');
-    assertEqual(result.changed, true);
-    assertEqual(result.vscode_restarted, true);
+    var target = result.targets[0];
+    assertEqual(target.status, 'success');
+    assertEqual(target.changed, true);
+    assertEqual(target.vscode_restarted, true);
 
     var quitCall = commandLog.filter(function (c) {
       return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[6] === '/usr/bin/osascript';
@@ -716,10 +737,11 @@ test('run(): already at the target version (no change) -> never attempts a resta
     mockConfig.listExtensionsStdout = 'ms-python.python@2024.1.0\n';
     mockConfig.vscodeRunningSequence = [true];
     var result = JSON.parse(run(makeArgv(
-      { extension_id: 'ms-python.python', version: '2024.1.0', extension_path: JDOE_PATH }, false,
+      { extension_id: 'ms-python.python', desired_version: '2024.1.0', extension_path: JDOE_PATH }, false,
     )));
-    assertEqual(result.status, 'skipped');
-    assertEqual(result.vscode_restarted, false);
+    var target = result.targets[0];
+    assertEqual(target.status, 'skipped');
+    assertEqual(target.vscode_restarted, false);
     var quitCall = commandLog.filter(function (c) {
       return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[6] === '/usr/bin/osascript';
     });
@@ -733,11 +755,12 @@ test('run(): dry run with a pending change -> never attempts a restart even if V
     mockConfig.listExtensionsStdout = 'ms-python.python@2024.1.0\n';
     mockConfig.vscodeRunningSequence = [true];
     var result = JSON.parse(run(makeArgv(
-      { extension_id: 'ms-python.python', version: '2024.5.0', extension_path: JDOE_PATH }, true,
+      { extension_id: 'ms-python.python', desired_version: '2024.5.0', extension_path: JDOE_PATH }, true,
     )));
-    assertEqual(result.status, 'skipped');
+    var target = result.targets[0];
+    assertEqual(target.status, 'skipped');
     assertEqual(result.dry_run, true);
-    assertEqual(result.vscode_restarted, false);
+    assertEqual(target.vscode_restarted, false);
     var quitCall = commandLog.filter(function (c) {
       return c.launchPath === '/bin/launchctl' && c.args[2] === '/usr/bin/sudo' && c.args[6] === '/usr/bin/osascript';
     });
@@ -745,17 +768,19 @@ test('run(): dry run with a pending change -> never attempts a restart even if V
   });
 });
 
-test('run(): differing version, CLI install fails -> failure envelope', function () {
+test('run(): differing version, CLI install fails -> failure envelope, stderr folded into the message (no stderr key on error)', function () {
   withFileExists(function () { return true; }, function () {
     mockConfig.idUidByUser.jdoe = 501;
     mockConfig.listExtensionsStdout = 'ms-python.python@2024.1.0\n';
     mockConfig.installResult = { exitCode: 1, stdout: '', stderr: 'boom' };
     var result = JSON.parse(run(makeArgv(
-      { extension_id: 'ms-python.python', version: '2024.5.0', extension_path: JDOE_PATH }, false,
+      { extension_id: 'ms-python.python', desired_version: '2024.5.0', extension_path: JDOE_PATH }, false,
     )));
-    assertEqual(result.status, 'failure');
-    assertEqual(result.error.code, 'EXTENSION_VERSION_CHANGE_FAILED');
-    assertEqual(result.error.stderr, 'boom');
+    var target = result.targets[0];
+    assertEqual(target.status, 'failure');
+    assertEqual(target.error.code, 'UPGRADE_INCOMPLETE');
+    assertTrue(target.error.message.indexOf('boom') !== -1);
+    assertTrue(!Object.prototype.hasOwnProperty.call(target.error, 'stderr'));
   });
 });
 
@@ -764,15 +789,16 @@ test('run(): dry run with a pending version change -> skipped, no CLI action att
     mockConfig.idUidByUser.jdoe = 501;
     mockConfig.listExtensionsStdout = 'ms-python.python@2024.1.0\n';
     var result = JSON.parse(run(makeArgv(
-      { extension_id: 'ms-python.python', version: '2024.5.0', extension_path: JDOE_PATH }, true,
+      { extension_id: 'ms-python.python', desired_version: '2024.5.0', extension_path: JDOE_PATH }, true,
     )));
-    assertEqual(result.status, 'skipped');
-    assertEqual(result.changed, false);
-    assertEqual(result.cli_result, { attempted: false, dry_run: true });
+    var target = result.targets[0];
+    assertEqual(target.status, 'skipped');
+    assertEqual(target.changed, false);
+    assertEqual(target.cli_result, { attempted: false, dry_run: true });
   });
 });
 
-test('run(): no version given, extension already latest -> success, not changed', function () {
+test('run(): no desired_version given, extension already latest -> success, not changed', function () {
   withFileExists(function () { return true; }, function () {
     mockConfig.idUidByUser.jdoe = 501;
     mockConfig.listExtensionsStdout = 'ms-python.python@2024.9.0\n'; // same before and after
@@ -780,9 +806,10 @@ test('run(): no version given, extension already latest -> success, not changed'
     var result = JSON.parse(run(makeArgv(
       { extension_id: 'ms-python.python', extension_path: JDOE_PATH }, false,
     )));
-    assertEqual(result.action, 'upgrade_to_latest');
-    assertEqual(result.status, 'success');
-    assertEqual(result.changed, false);
+    var target = result.targets[0];
+    assertEqual(target.action, 'upgrade_to_latest');
+    assertEqual(target.status, 'success');
+    assertEqual(target.changed, false);
   });
 });
 
@@ -791,11 +818,12 @@ test('run(): extension_path names a user with no account -> still proceeds, ran_
     // idUidByUser left empty on purpose - "jdoe" has no resolvable account.
     mockConfig.listExtensionsStdout = 'ms-python.python@2024.1.0\n';
     var result = JSON.parse(run(makeArgv(
-      { extension_id: 'ms-python.python', version: '2024.1.0', extension_path: JDOE_PATH }, true,
+      { extension_id: 'ms-python.python', desired_version: '2024.1.0', extension_path: JDOE_PATH }, true,
     )));
-    assertEqual(result.target_user, 'jdoe');
-    assertEqual(result.ran_as_root, true);
-    assertEqual(result.user_resolution_note, 'EXTENSION_PATH_USER_NOT_FOUND');
+    var target = result.targets[0];
+    assertEqual(target.target_user, 'jdoe');
+    assertEqual(target.ran_as_root, true);
+    assertEqual(target.user_resolution_note, 'EXTENSION_PATH_USER_NOT_FOUND');
     // And the code CLI was invoked directly (root), not via launchctl asuser.
     var launchctlCalls = commandLog.filter(function (c) { return c.launchPath === '/bin/launchctl'; });
     assertEqual(launchctlCalls.length, 0);
@@ -806,11 +834,31 @@ test('run(): missing extension_path -> still proceeds (runs as root), never abor
   withFileExists(function () { return true; }, function () {
     mockConfig.listExtensionsStdout = 'ms-python.python@2024.1.0\n';
     var result = JSON.parse(run(makeArgv(
-      { extension_id: 'ms-python.python', version: '2024.1.0' }, true,
+      { extension_id: 'ms-python.python', desired_version: '2024.1.0' }, true,
     )));
-    assertEqual(result.target_user, null);
-    assertEqual(result.ran_as_root, true);
-    assertEqual(result.status, 'skipped'); // already at 2024.1.0
+    var target = result.targets[0];
+    assertEqual(target.target_user, null);
+    assertEqual(target.ran_as_root, true);
+    assertEqual(target.status, 'skipped'); // already at 2024.1.0
+  });
+});
+
+test('run(): the envelope is wrapped in scope/targets[] - per-target fields not flattened onto the envelope root, but base contract fields (status/changed/error) DO stay at the root', function () {
+  withFileExists(function () { return true; }, function () {
+    mockConfig.idUidByUser.jdoe = 501;
+    mockConfig.listExtensionsStdout = 'ms-python.python@2024.1.0\n';
+    var result = JSON.parse(run(makeArgv(
+      { extension_id: 'ms-python.python', desired_version: '2024.1.0', extension_path: JDOE_PATH }, true,
+    )));
+    assertEqual(result.scope, 'anchor');
+    assertEqual(result.targets.length, 1);
+    assertEqual(result.targets[0].extension_id, 'ms-python.python');
+    assertEqual(Object.prototype.hasOwnProperty.call(result, 'extension_id'), false);
+    assertEqual(Object.prototype.hasOwnProperty.call(result, 'status'), true);
+    assertEqual(Object.prototype.hasOwnProperty.call(result, 'changed'), true);
+    assertEqual(Object.prototype.hasOwnProperty.call(result, 'error'), true);
+    assertEqual(result.status, result.targets[0].status);
+    assertEqual(result.changed, result.targets[0].changed);
   });
 });
 

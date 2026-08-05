@@ -216,21 +216,22 @@ Describe 'Get-VSCodeRunOutcome' {
     $outcome.Changed | Should -BeFalse
   }
 
-  It 'set_version fails -> failure, with stderr in the error' {
+  It 'set_version fails -> failure, with stderr folded into the message (canonical error object is {code, message} only)' {
     $decision = [PSCustomObject]@{ Action = 'set_version'; InstalledVersion = '2024.1.0' }
     $actionResult = [PSCustomObject]@{ Attempted = $true; Ok = $false; Stderr = 'network error' }
     $outcome = Get-VSCodeRunOutcome $decision $actionResult $null $false
     $outcome.Status | Should -Be 'failure'
     $outcome.Changed | Should -BeFalse
-    $outcome.Error.Code | Should -Be 'EXTENSION_VERSION_CHANGE_FAILED'
-    $outcome.Error.Stderr | Should -Be 'network error'
+    $outcome.Error.Code | Should -Be 'UPGRADE_INCOMPLETE'
+    $outcome.Error.Message | Should -BeLike '*network error*'
+    $outcome.Error.PSObject.Properties.Name | Should -Not -Contain 'Stderr'
   }
 
-  It 'set_version fails with no stderr -> error.Stderr defaults to empty string' {
+  It 'set_version fails with no stderr -> message has no dangling separator' {
     $decision = [PSCustomObject]@{ Action = 'set_version'; InstalledVersion = '2024.1.0' }
     $actionResult = [PSCustomObject]@{ Attempted = $true; Ok = $false }
     $outcome = Get-VSCodeRunOutcome $decision $actionResult $null $false
-    $outcome.Error.Stderr | Should -Be ''
+    $outcome.Error.Message | Should -Be 'code --install-extension failed'
   }
 
   It 'upgrade_to_latest succeeds and version changed -> success, changed' {

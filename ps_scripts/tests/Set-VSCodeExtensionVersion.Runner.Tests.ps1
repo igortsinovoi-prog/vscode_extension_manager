@@ -60,6 +60,8 @@ Describe 'Set-VSCodeExtensionVersion.Runner' {
     Mock Get-VSCodeFileContent { $null }
     Mock Set-VSCodeFileContent { }
     Mock Remove-VSCodeFileIfExists { }
+    Mock Get-VSCodeFileAcl { $null }
+    Mock Set-VSCodeFileAcl { }
 
     Mock Invoke-VSCodeNativeCommand {
       param($FilePath, $ArgumentList, $TimeoutSec)
@@ -247,19 +249,36 @@ Context 'Enable-VSCodeSignatureVerificationBypass / Restore-VSCodeSignatureVerif
     # Restore-VSCodeSignatureVerification reads it back from the on-disk
     # backup instead (State.BackupPath), not from memory - see that
     # function's own comment on why that matters.
-    $state.BackupPath | Should -Be 'C:\Users\jdoe\AppData\Roaming\Code\User\settings.json.rwcbak'
+    $state.BackupPath | Should -Be 'C:\Users\jdoe\AppData\Roaming\Code\User\settings.json.glow-bak'
     # Two calls so far: the real on-disk backup (exact original raw text)
     # and the bypassed settings.json.
     Should -Invoke Set-VSCodeFileContent -Times 1 -ParameterFilter { $Path -eq $state.BackupPath -and $Content -eq $originalRaw }
     Should -Invoke Set-VSCodeFileContent -Times 1 -ParameterFilter {
       $Content -match '"editor.fontSize":\s*14' -and $Content -match '"extensions.verifySignature":\s*false'
     }
+    # The backup's permissions are captured from the ORIGINAL settings.json
+    # BEFORE the backup is written, then explicitly reapplied after -
+    # never left to whatever ACL the write happens to inherit.
+    Should -Invoke Get-VSCodeFileAcl -Times 1 -ParameterFilter { $Path -eq 'C:\Users\jdoe\AppData\Roaming\Code\User\settings.json' }
+    Should -Invoke Set-VSCodeFileAcl -Times 1 -ParameterFilter { $Path -eq $state.BackupPath }
 
     Restore-VSCodeSignatureVerification $state
     # Now three total: the two above, plus the restore write - the
     # backup and the restore both legitimately have the same content
     # (the exact original raw text), so two calls now match that filter.
     Should -Invoke Set-VSCodeFileContent -Times 2 -ParameterFilter { $Content -eq $originalRaw }
+    Should -Invoke Remove-VSCodeFileIfExists -Times 1 -ParameterFilter { $Path -eq $state.BackupPath }
+  }
+
+  It 'restore backup is deleted even when the restore write itself fails (never stranded - it can carry secrets)' {
+    $originalRaw = '{"editor.fontSize": 14}'
+    Mock Get-VSCodeFileContent { $originalRaw }
+    $state = Enable-VSCodeSignatureVerificationBypass 'C:\Users\jdoe\AppData\Roaming\Code'
+    Mock Set-VSCodeFileContent {
+      param($Path, $Content)
+      if ($Path -eq $state.SettingsPath) { throw 'simulated locked file' }
+    }
+    Restore-VSCodeSignatureVerification $state
     Should -Invoke Remove-VSCodeFileIfExists -Times 1 -ParameterFilter { $Path -eq $state.BackupPath }
   }
 
@@ -431,97 +450,118 @@ Context 'Get-VSCodeRunningPidsForUser / Restart-VSCodeIfRunning' {
 }
 
 Context 'Invoke-SetVSCodeExtensionVersion end-to-end' {
-  It 'invalid extension_id -> failure envelope, INVALID_PARAMS' {
+  It 'invalid extension_id -> failure envelope, INVALID_PARAMS, wrapped in scope/targets[], mirrored at envelope level' {
     $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'not-an-id' } $true) | ConvertFrom-Json
+    $result.scope | Should -Be 'anchor'
+    $result.targets.Count | Should -Be 1
+    $target = $result.targets[0]
+    $target.status | Should -Be 'failure'
+    $target.error.code | Should -Be 'INVALID_PARAMS'
+    # Base envelope fields (contract-standards.md) stay present ALONGSIDE
+    # scope/targets[], not replaced by them - mirroring the one target's
+    # own status/changed/error since this script only ever has one.
     $result.status | Should -Be 'failure'
+    $result.changed | Should -BeFalse
     $result.error.code | Should -Be 'INVALID_PARAMS'
-    # Failure envelopes mirror the success envelope's own full field list -
+    # Failure targets mirror the success target's own full field list -
     # whatever was already figured out before the failure (here, just the
     # raw invalid extension_id itself) is reported as-is; everything not
     # yet reached stays at its safe "not yet known" default rather than
     # just being absent, so a caller never has to special-case a failure
-    # envelope's shape vs. a success one's.
-    $result.extension_id | Should -Be 'not-an-id'
-    $result.target_version | Should -BeNullOrEmpty
-    $result.extension_path | Should -BeNullOrEmpty
-    $result.action | Should -BeNullOrEmpty
-    $result.target_user | Should -BeNullOrEmpty
-    $result.used_system_fallback | Should -BeTrue
-    $result.cli_result | Should -BeNullOrEmpty
-    $result.vscode_restarted | Should -BeFalse
+    # target's shape vs. a success one's.
+    $target.extension_id | Should -Be 'not-an-id'
+    $target.desired_version | Should -BeNullOrEmpty
+    $target.extension_path | Should -BeNullOrEmpty
+    $target.action | Should -BeNullOrEmpty
+    $target.target_user | Should -BeNullOrEmpty
+    $target.used_system_fallback | Should -BeTrue
+    $target.cli_result | Should -BeNullOrEmpty
+    $target.vscode_restarted | Should -BeFalse
   }
 
-  It 'invalid version -> failure envelope, INVALID_PARAMS' {
-    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = 'not-semver' } $true) | ConvertFrom-Json
-    $result.status | Should -Be 'failure'
-    $result.error.code | Should -Be 'INVALID_PARAMS'
-    $result.extension_id | Should -Be 'ms-python.python'
-    $result.target_version | Should -Be 'not-semver'
+  It 'invalid desired_version -> failure envelope, INVALID_PARAMS' {
+    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; desired_version = 'not-semver' } $true) | ConvertFrom-Json
+    $target = $result.targets[0]
+    $target.status | Should -Be 'failure'
+    $target.error.code | Should -Be 'INVALID_PARAMS'
+    $target.extension_id | Should -Be 'ms-python.python'
+    $target.desired_version | Should -Be 'not-semver'
   }
 
-  It 'code.cmd not found anywhere -> failure envelope, VSCODE_NOT_INSTALLED' {
+  It 'code.cmd not found anywhere -> failure envelope, CLI_NOT_FOUND' {
     Mock Test-VSCodeFileExists { $false }
     $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
-    $result.status | Should -Be 'failure'
-    $result.error.code | Should -Be 'VSCODE_NOT_INSTALLED'
+    $target = $result.targets[0]
+    $target.status | Should -Be 'failure'
+    $target.error.code | Should -Be 'CLI_NOT_FOUND'
     # Unlike macOS (which checks VS Code's own install location before
     # ever reading extension_path), Windows resolves the target user
     # first - so extension_path/target_user are already known here.
-    $result.extension_path | Should -Be $script:JdoePath
-    $result.target_user | Should -Be 'jdoe'
+    $target.extension_path | Should -Be $script:JdoePath
+    $target.target_user | Should -Be 'jdoe'
   }
 
-  It 'code --list-extensions itself fails -> failure envelope, LIST_EXTENSIONS_FAILED' {
+  It 'code --list-extensions itself fails -> failure envelope, UPGRADE_INCOMPLETE with the raw CLI failure in the message' {
     $script:MockConfig.ListExtensionsExitCode = 1
-    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.1.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
-    $result.status | Should -Be 'failure'
-    $result.error.code | Should -Be 'LIST_EXTENSIONS_FAILED'
-    $result.extension_id | Should -Be 'ms-python.python'
-    $result.target_version | Should -Be '2024.1.0'
-    $result.extension_path | Should -Be $script:JdoePath
-    $result.target_user | Should -Be 'jdoe'
-    $result.used_system_fallback | Should -BeFalse
+    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; desired_version = '2024.1.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
+    $target = $result.targets[0]
+    $target.status | Should -Be 'failure'
+    $target.error.code | Should -Be 'UPGRADE_INCOMPLETE'
+    $target.error.message | Should -BeLike '*list-extensions*'
+    $target.extension_id | Should -Be 'ms-python.python'
+    $target.desired_version | Should -Be '2024.1.0'
+    $target.extension_path | Should -Be $script:JdoePath
+    $target.target_user | Should -Be 'jdoe'
+    $target.used_system_fallback | Should -BeFalse
   }
 
   It 'extension not installed -> skipped, no CLI action taken' {
     $script:MockConfig.ListExtensionsStdout = "some-other.extension@1.0.0`n"
-    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.1.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
-    $result.status | Should -Be 'skipped'
-    $result.changed | Should -BeFalse
-    $result.action | Should -Be 'not_installed'
-    $result.cli_result | Should -BeNullOrEmpty
+    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; desired_version = '2024.1.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
+    $target = $result.targets[0]
+    $target.status | Should -Be 'skipped'
+    $target.changed | Should -BeFalse
+    $target.action | Should -Be 'not_installed'
+    $target.cli_result | Should -BeNullOrEmpty
   }
 
   It 'already at the target version -> skipped, no CLI action taken' {
     $script:MockConfig.ListExtensionsStdout = "ms-python.python@2024.1.0`n"
-    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.1.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
-    $result.status | Should -Be 'skipped'
-    $result.action | Should -Be 'already_correct_version'
+    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; desired_version = '2024.1.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
+    $target = $result.targets[0]
+    $target.status | Should -Be 'skipped'
+    $target.action | Should -Be 'already_correct_version'
   }
 
   It 'differing version, real run -> success, changed, version pin invoked' {
     $script:MockConfig.ListExtensionsStdoutSequence = @("ms-python.python@2024.1.0`n", "ms-python.python@2024.5.0`n")
     $script:MockConfig.InstallResult = [PSCustomObject]@{ ExitCode = 0; Stdout = ''; Stderr = '' }
-    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.5.0'; extension_path = $script:JdoePath } $false) | ConvertFrom-Json
-    $result.status | Should -Be 'success'
-    $result.changed | Should -BeTrue
-    $result.action | Should -Be 'set_version'
-    $result.installed_version_before | Should -Be '2024.1.0'
-    $result.installed_version_after | Should -Be '2024.5.0'
-    $result.cli_result.Ok | Should -BeTrue
+    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; desired_version = '2024.5.0'; extension_path = $script:JdoePath } $false) | ConvertFrom-Json
+    $target = $result.targets[0]
+    $target.status | Should -Be 'success'
+    $target.changed | Should -BeTrue
+    $target.action | Should -Be 'set_version'
+    $target.installed_version_before | Should -Be '2024.1.0'
+    $target.installed_version_after | Should -Be '2024.5.0'
+    $target.cli_result.Ok | Should -BeTrue
     # VS Code isn't "running" per the default mock (RunningPids empty) -
     # nothing to restart, so this must stay false.
-    $result.vscode_restarted | Should -BeFalse
+    $target.vscode_restarted | Should -BeFalse
+    # Base envelope fields mirror the target on success too.
+    $result.status | Should -Be 'success'
+    $result.changed | Should -BeTrue
+    $result.error | Should -BeNullOrEmpty
   }
 
   It 'differing version, real run, VS Code already running -> restarts it, reports vscode_restarted true' {
     $script:MockConfig.ListExtensionsStdoutSequence = @("ms-python.python@2024.1.0`n", "ms-python.python@2024.5.0`n")
     $script:MockConfig.InstallResult = [PSCustomObject]@{ ExitCode = 0; Stdout = ''; Stderr = '' }
     $script:MockConfig.RunningPids = @(4242)
-    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.5.0'; extension_path = $script:JdoePath } $false) | ConvertFrom-Json
-    $result.status | Should -Be 'success'
-    $result.changed | Should -BeTrue
-    $result.vscode_restarted | Should -BeTrue
+    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; desired_version = '2024.5.0'; extension_path = $script:JdoePath } $false) | ConvertFrom-Json
+    $target = $result.targets[0]
+    $target.status | Should -Be 'success'
+    $target.changed | Should -BeTrue
+    $target.vscode_restarted | Should -BeTrue
     # Graceful close first (the default mock simulates it succeeding) -
     # Stop-Process is the last-resort fallback, not needed here.
     $script:GracefulCloseLog | Should -Be @(4242)
@@ -531,56 +571,63 @@ Context 'Invoke-SetVSCodeExtensionVersion end-to-end' {
   It 'already at the target version (no change) -> never attempts a restart even if VS Code is running' {
     $script:MockConfig.ListExtensionsStdout = "ms-python.python@2024.1.0`n"
     $script:MockConfig.RunningPids = @(4242)
-    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.1.0'; extension_path = $script:JdoePath } $false) | ConvertFrom-Json
-    $result.status | Should -Be 'skipped'
-    $result.vscode_restarted | Should -BeFalse
+    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; desired_version = '2024.1.0'; extension_path = $script:JdoePath } $false) | ConvertFrom-Json
+    $target = $result.targets[0]
+    $target.status | Should -Be 'skipped'
+    $target.vscode_restarted | Should -BeFalse
     $script:StopProcessLog.Count | Should -Be 0
   }
 
   It 'dry run with a pending change -> never attempts a restart even if VS Code is running' {
     $script:MockConfig.ListExtensionsStdout = "ms-python.python@2024.1.0`n"
     $script:MockConfig.RunningPids = @(4242)
-    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.5.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
-    $result.status | Should -Be 'skipped'
+    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; desired_version = '2024.5.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
+    $target = $result.targets[0]
+    $target.status | Should -Be 'skipped'
     $result.dry_run | Should -BeTrue
-    $result.vscode_restarted | Should -BeFalse
+    $target.vscode_restarted | Should -BeFalse
     $script:StopProcessLog.Count | Should -Be 0
   }
 
-  It 'differing version, CLI install fails -> failure envelope' {
+  It 'differing version, CLI install fails -> failure envelope, stderr folded into the message (no stderr key on error)' {
     $script:MockConfig.ListExtensionsStdout = "ms-python.python@2024.1.0`n"
     $script:MockConfig.InstallResult = [PSCustomObject]@{ ExitCode = 1; Stdout = ''; Stderr = 'boom' }
-    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.5.0'; extension_path = $script:JdoePath } $false) | ConvertFrom-Json
-    $result.status | Should -Be 'failure'
-    $result.error.code | Should -Be 'EXTENSION_VERSION_CHANGE_FAILED'
-    $result.error.stderr | Should -Be 'boom'
+    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; desired_version = '2024.5.0'; extension_path = $script:JdoePath } $false) | ConvertFrom-Json
+    $target = $result.targets[0]
+    $target.status | Should -Be 'failure'
+    $target.error.code | Should -Be 'UPGRADE_INCOMPLETE'
+    $target.error.message | Should -BeLike '*boom*'
+    ($target.error.PSObject.Properties.Name) | Should -Not -Contain 'stderr'
   }
 
   It 'dry run with a pending version change -> skipped, no CLI action attempted' {
     $script:MockConfig.ListExtensionsStdout = "ms-python.python@2024.1.0`n"
-    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.5.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
-    $result.status | Should -Be 'skipped'
-    $result.changed | Should -BeFalse
-    $result.cli_result.attempted | Should -BeFalse
-    $result.cli_result.dry_run | Should -BeTrue
+    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; desired_version = '2024.5.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
+    $target = $result.targets[0]
+    $target.status | Should -Be 'skipped'
+    $target.changed | Should -BeFalse
+    $target.cli_result.attempted | Should -BeFalse
+    $target.cli_result.dry_run | Should -BeTrue
   }
 
-  It 'no version given, extension already latest -> success, not changed' {
+  It 'no desired_version given, extension already latest -> success, not changed' {
     $script:MockConfig.ListExtensionsStdout = "ms-python.python@2024.9.0`n" # same before and after
     $script:MockConfig.InstallResult = [PSCustomObject]@{ ExitCode = 0; Stdout = ''; Stderr = '' }
     $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; extension_path = $script:JdoePath } $false) | ConvertFrom-Json
-    $result.action | Should -Be 'upgrade_to_latest'
-    $result.status | Should -Be 'success'
-    $result.changed | Should -BeFalse
+    $target = $result.targets[0]
+    $target.action | Should -Be 'upgrade_to_latest'
+    $target.status | Should -Be 'success'
+    $target.changed | Should -BeFalse
   }
 
   It 'extension_path names a user with no profile directory -> still proceeds, used_system_fallback true' {
     Mock Test-VSCodePathAccess { [PSCustomObject]@{ Exists = $false; AccessDenied = $false } }
     $script:MockConfig.ListExtensionsStdout = "ms-python.python@2024.1.0`n"
-    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.1.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
-    $result.target_user | Should -Be 'jdoe'
-    $result.used_system_fallback | Should -BeTrue
-    $result.user_resolution_note | Should -Be 'EXTENSION_PATH_USER_NOT_FOUND'
+    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; desired_version = '2024.1.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
+    $target = $result.targets[0]
+    $target.target_user | Should -Be 'jdoe'
+    $target.used_system_fallback | Should -BeTrue
+    $target.user_resolution_note | Should -Be 'EXTENSION_PATH_USER_NOT_FOUND'
     # And the CLI was pointed at SYSTEM's own extensions dir, not a real user's.
     $listCall = $script:CommandLog | Where-Object { $_.ArgumentList -contains '--list-extensions' } | Select-Object -First 1
     $listCall.ArgumentList[1] | Should -Be $Script:RootFallbackExtensionsDir
@@ -588,10 +635,11 @@ Context 'Invoke-SetVSCodeExtensionVersion end-to-end' {
 
   It 'missing extension_path -> still proceeds (SYSTEM fallback), never aborts' {
     $script:MockConfig.ListExtensionsStdout = "ms-python.python@2024.1.0`n"
-    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.1.0' } $true) | ConvertFrom-Json
-    $result.target_user | Should -BeNullOrEmpty
-    $result.used_system_fallback | Should -BeTrue
-    $result.status | Should -Be 'skipped' # already at 2024.1.0
+    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; desired_version = '2024.1.0' } $true) | ConvertFrom-Json
+    $target = $result.targets[0]
+    $target.target_user | Should -BeNullOrEmpty
+    $target.used_system_fallback | Should -BeTrue
+    $target.status | Should -Be 'skipped' # already at 2024.1.0
   }
 }
 
@@ -616,12 +664,12 @@ Context 'ConvertTo-VSCodeCliResultJson / ConvertTo-VSCodeErrorJson' {
     ConvertTo-VSCodeCliResultJson $null | Should -BeNullOrEmpty
   }
 
-  It 'converts an error result to lowercase code/message/stderr fields' {
-    $errorResult = [PSCustomObject]@{ Code = 'BOOM'; Message = 'it broke'; Stderr = 'trace' }
+  It 'converts an error result to lowercase code/message fields only - no stderr key (canonical envelope-level error shape)' {
+    $errorResult = [PSCustomObject]@{ Code = 'BOOM'; Message = 'it broke' }
     $json = ConvertTo-VSCodeErrorJson $errorResult
     $json.code | Should -Be 'BOOM'
     $json.message | Should -Be 'it broke'
-    $json.stderr | Should -Be 'trace'
+    ($json.PSObject.Properties.Name) | Should -Not -Contain 'stderr'
   }
 
   It 'returns $null for a $null error result' {
@@ -641,7 +689,7 @@ Context 'JSON envelope field casing (raw wire format, not just case-insensitive 
   It 'a real (non-dry-run) successful action serializes cli_result with snake_case keys, not PascalCase' {
     $script:MockConfig.ListExtensionsStdoutSequence = @("ms-python.python@2024.1.0`n", "ms-python.python@2024.5.0`n")
     $script:MockConfig.InstallResult = [PSCustomObject]@{ ExitCode = 0; Stdout = 'ok'; Stderr = '' }
-    $rawJson = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.5.0'; extension_path = $script:JdoePath } $false)
+    $rawJson = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; desired_version = '2024.5.0'; extension_path = $script:JdoePath } $false)
     $rawJson | Should -Match '"exit_code":0'
     $rawJson | Should -Match '"attempted":true'
     # Plain PowerShell -cmatch (case-SENSITIVE), not Pester's Should -Match
@@ -655,19 +703,45 @@ Context 'JSON envelope field casing (raw wire format, not just case-insensitive 
 
   It 'a dry-run action serializes cli_result as attempted/dry_run, not PascalCase' {
     $script:MockConfig.ListExtensionsStdout = "ms-python.python@2024.1.0`n"
-    $rawJson = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.5.0'; extension_path = $script:JdoePath } $true)
+    $rawJson = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; desired_version = '2024.5.0'; extension_path = $script:JdoePath } $true)
     $rawJson | Should -Match '"dry_run":true'
     ($rawJson -cmatch '"DryRun"') | Should -BeFalse
   }
 
-  It 'a failed CLI action serializes error with lowercase code/message/stderr keys' {
+  It 'a failed CLI action serializes error with lowercase code/message keys, no stderr key on the error object (cli_result.stderr is a different, unrelated field and legitimately still carries the raw text)' {
     $script:MockConfig.ListExtensionsStdout = "ms-python.python@2024.1.0`n"
     $script:MockConfig.InstallResult = [PSCustomObject]@{ ExitCode = 1; Stdout = ''; Stderr = 'boom' }
-    $rawJson = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; version = '2024.5.0'; extension_path = $script:JdoePath } $false)
-    $rawJson | Should -Match '"code":"EXTENSION_VERSION_CHANGE_FAILED"'
-    $rawJson | Should -Match '"stderr":"boom"'
+    $rawJson = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; desired_version = '2024.5.0'; extension_path = $script:JdoePath } $false)
+    $rawJson | Should -Match '"code":"UPGRADE_INCOMPLETE"'
+    $rawJson | Should -Match '"message":"[^"]*boom[^"]*"'
     ($rawJson -cmatch '"Code"') | Should -BeFalse
     ($rawJson -cmatch '"Message"') | Should -BeFalse
+    # Check the ERROR object specifically (not a blanket string search over
+    # the whole JSON) - cli_result.stderr is a separate, legitimate field
+    # that DOES still carry "boom" in this exact scenario, so a bare
+    # `-cmatch '"stderr":"boom"'` over the raw text would false-fail here.
+    $parsed = $rawJson | ConvertFrom-Json
+    $parsed.targets[0].error.PSObject.Properties.Name | Should -Not -Contain 'stderr'
+    $parsed.error.PSObject.Properties.Name | Should -Not -Contain 'stderr'
+    $parsed.targets[0].cli_result.stderr | Should -Be 'boom'
+  }
+
+  It 'per-target fields (extension_id etc) live in targets[], not flattened onto the envelope root - but base contract fields (status/changed/error) DO stay at the root too, per contract-standards.md' {
+    $script:MockConfig.ListExtensionsStdout = "ms-python.python@2024.1.0`n"
+    $result = Invoke-SetVSCodeExtensionVersion (New-EncodedInput @{ extension_id = 'ms-python.python'; desired_version = '2024.1.0'; extension_path = $script:JdoePath } $true) | ConvertFrom-Json
+    $result.scope | Should -Be 'anchor'
+    $result.targets.Count | Should -Be 1
+    $result.targets[0].extension_id | Should -Be 'ms-python.python'
+    # extension_id must NOT also appear flattened on the envelope root...
+    $result.PSObject.Properties.Name | Should -Not -Contain 'extension_id'
+    # ...but status/changed/error are the mandatory base envelope (every
+    # script must satisfy it) and ARE required at the root, alongside
+    # scope/targets[], not replaced by them.
+    $result.PSObject.Properties.Name | Should -Contain 'status'
+    $result.PSObject.Properties.Name | Should -Contain 'changed'
+    $result.PSObject.Properties.Name | Should -Contain 'error'
+    $result.status | Should -Be $result.targets[0].status
+    $result.changed | Should -Be $result.targets[0].changed
   }
 }
 }
@@ -690,5 +764,188 @@ Context 'JSON envelope field casing (raw wire format, not just case-insensitive 
 Describe 'Resolve-VSCodeUserProfilePath (real, unmocked)' {
   It 'falls back to the naive C:\Users\USERNAME guess when the account cannot be resolved via Win32_UserProfile' {
     Resolve-VSCodeUserProfilePath 'definitely-not-a-real-account-98765' | Should -Be 'C:\Users\definitely-not-a-real-account-98765'
+  }
+}
+
+# Set-VSCodeFileContent is mocked away in every test in the main Describe
+# above - its own [System.IO.File]::Replace-based atomic-write pattern
+# (Test-VSCodeFileExists, Test-VSCodeFileExists again for the swap
+# backup, ...) is never actually exercised there. Real, unmocked
+# filesystem operations against a real temp directory, same rationale as
+# the sibling Describe above.
+Describe 'Set-VSCodeFileContent (real, unmocked)' {
+  BeforeEach {
+    $script:TestDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
+    New-Item -ItemType Directory -Path $script:TestDir -Force | Out-Null
+    $script:TestPath = Join-Path $script:TestDir 'settings.json'
+  }
+
+  AfterEach {
+    Remove-Item -LiteralPath $script:TestDir -Recurse -Force -ErrorAction SilentlyContinue
+  }
+
+  It 'writes a brand-new file (nothing to replace yet), UTF-8 with NO BOM, and leaves no stray temp files behind' {
+    Set-VSCodeFileContent $script:TestPath '{"a":1}'
+    Get-Content -LiteralPath $script:TestPath -Raw | Should -Be '{"a":1}'
+    # @() wrap matters under real PS 5.1 - a bare Get-ChildItem result for
+    # exactly one match is a scalar with no .Count property there (only
+    # PS 7+ gives every scalar a universal Count) - confirmed live via a
+    # real PropertyNotFoundException on real hardware before this fix.
+    @(Get-ChildItem -Path $script:TestDir).Count | Should -Be 1
+    $firstBytes = [System.IO.File]::ReadAllBytes($script:TestPath) | Select-Object -First 3
+    # UTF-8 BOM is EF BB BF - Set-Content -Encoding utf8 would have
+    # written it on PS 5.1; WriteAllText with an explicit no-BOM
+    # UTF8Encoding must not.
+    ($firstBytes[0] -eq 0xEF -and $firstBytes[1] -eq 0xBB -and $firstBytes[2] -eq 0xBF) | Should -BeFalse
+  }
+
+  It 'overwrites an existing file via File.Replace, UTF-8 with no BOM, and leaves no stray temp/netbak files behind' {
+    Set-Content -LiteralPath $script:TestPath -Value '{"a":1}' -Encoding utf8
+    Set-VSCodeFileContent $script:TestPath '{"a":2}'
+    Get-Content -LiteralPath $script:TestPath -Raw | Should -Be '{"a":2}'
+    @(Get-ChildItem -Path $script:TestDir).Count | Should -Be 1
+    $firstBytes = [System.IO.File]::ReadAllBytes($script:TestPath) | Select-Object -First 3
+    ($firstBytes[0] -eq 0xEF -and $firstBytes[1] -eq 0xBB -and $firstBytes[2] -eq 0xBF) | Should -BeFalse
+  }
+
+  It 'preserves the original file''s ACL across an overwrite (captured before, reapplied after)' {
+    Set-Content -LiteralPath $script:TestPath -Value '{"a":1}' -Encoding utf8
+    $originalAcl = Get-Acl -LiteralPath $script:TestPath
+    Set-VSCodeFileContent $script:TestPath '{"a":2}'
+    $newAcl = Get-Acl -LiteralPath $script:TestPath
+    $newAcl.Owner | Should -Be $originalAcl.Owner
+  }
+
+  It 'a locked destination (simulated AV/Defender contention) is retried, then fails without leaving the original content missing or a stray netbak behind' {
+    # -NoNewline matters here specifically: this test reads the ORIGINAL
+    # content back at the end (the write is expected to fail and leave it
+    # untouched) - Set-Content appends a trailing newline by default,
+    # which would make a plain '{"a":1}' equality check false-fail
+    # against the real file content otherwise. The other two setup calls
+    # above don't need this - their content gets fully overwritten by a
+    # successful Set-VSCodeFileContent call either way.
+    Set-Content -LiteralPath $script:TestPath -Value '{"a":1}' -Encoding utf8 -NoNewline
+    # [System.IO.File]::Replace is a static .NET method - Pester can't
+    # mock it directly, so real contention is simulated with a real
+    # exclusive file lock (FileShare.None) instead, held for the whole
+    # call so both retry attempts genuinely fail with a sharing
+    # violation. This exercises the real bounded-retry loop for real, and
+    # confirms the one guarantee that matters even when both attempts
+    # fail: the destination is never left missing (File.Replace itself
+    # never gets far enough to touch it while the lock holds), and no
+    # throwaway netbak is left stranded on disk afterward.
+    $lockedStream = [System.IO.File]::Open($script:TestPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+    try {
+      { Set-VSCodeFileContent $script:TestPath '{"a":2}' } | Should -Throw
+    } finally {
+      $lockedStream.Close()
+    }
+    Get-Content -LiteralPath $script:TestPath -Raw | Should -Be '{"a":1}'
+    @(Get-ChildItem -Path $script:TestDir -Filter '*.glow-netbak').Count | Should -Be 0
+    @(Get-ChildItem -Path $script:TestDir -Filter '*.glow-tmp').Count | Should -Be 0
+  }
+}
+
+# Resolve-VSCodeSafePath is mocked away in every test in the main Describe
+# above - its real ancestor-chain-walking behavior (the actual point of
+# this fix: an ancestor DIRECTORY that's a reparse point, not just the
+# leaf) needs a real junction on a real filesystem to mean anything.
+# New-Item -ItemType Junction does not require elevation/Developer Mode
+# on Windows (unlike -ItemType SymbolicLink), so this runs in an ordinary
+# CI/test context.
+Describe 'Resolve-VSCodeSafePath / ancestor-chain safety (real, unmocked)' {
+  BeforeEach {
+    $script:TestDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
+    New-Item -ItemType Directory -Path $script:TestDir -Force | Out-Null
+  }
+
+  AfterEach {
+    Remove-Item -LiteralPath $script:TestDir -Recurse -Force -ErrorAction SilentlyContinue
+  }
+
+  It 'Test-VSCodeLocalDrive: the real system drive is not Network/CDRom -> true' {
+    Test-VSCodeLocalDrive $script:TestDir | Should -BeTrue
+  }
+
+  It 'Test-VSCodeLocalDrive: a UNC-shaped path -> false (DriveInfo rejects a non-drive-letter root)' {
+    Test-VSCodeLocalDrive '\\fileserver\share\extensions\foo-1.0.0' | Should -BeFalse
+  }
+
+  It 'Resolve-VSCodeSafePath: a real UNC path is rejected, but a \\?\-prefixed extended-length LOCAL path is not treated as UNC' {
+    Resolve-VSCodeSafePath '\\fileserver\share\extensions\foo-1.0.0' | Should -BeNullOrEmpty
+    $extendedPath = '\\?\' + (Join-Path $script:TestDir 'extensions\ms-python.python-2024.1.0')
+    New-Item -ItemType Directory -Path (Join-Path $script:TestDir 'extensions\ms-python.python-2024.1.0') -Force | Out-Null
+    Resolve-VSCodeSafePath $extendedPath | Should -Not -BeNullOrEmpty
+  }
+
+  It 'a clean nested path with no reparse points anywhere in its ancestry -> resolves normally' {
+    $nested = Join-Path $script:TestDir 'real\extensions\ms-python.python-2024.1.0'
+    New-Item -ItemType Directory -Path $nested -Force | Out-Null
+    Test-VSCodeAncestorChainSafe $nested | Should -BeTrue
+    Resolve-VSCodeSafePath $nested | Should -Be ([System.IO.Path]::GetFullPath($nested))
+  }
+
+  It 'a reparse point TWO LEVELS above the leaf (not the leaf itself) -> ancestor check catches it, ResolveVSCodeSafePath returns $null' {
+    $realTarget = Join-Path $script:TestDir 'real-target'
+    New-Item -ItemType Directory -Path $realTarget -Force | Out-Null
+    $junctionLink = Join-Path $script:TestDir 'linked'
+    New-Item -ItemType Junction -Path $junctionLink -Target $realTarget -Force | Out-Null
+    $leafUnderJunction = Join-Path $junctionLink 'extensions\ms-python.python-2024.1.0'
+    New-Item -ItemType Directory -Path (Join-Path $realTarget 'extensions\ms-python.python-2024.1.0') -Force | Out-Null
+
+    # The leaf itself ($leafUnderJunction) is an ordinary directory, not a
+    # reparse point - only its grandparent ($junctionLink) is. A guard
+    # that only checked the leaf's own reparse point would miss this.
+    Test-VSCodeAncestorChainSafe $leafUnderJunction | Should -BeFalse
+    Resolve-VSCodeSafePath $leafUnderJunction | Should -BeNullOrEmpty
+  }
+
+  It 'a missing (nonexistent) ancestor is not itself unsafe - only a REAL reparse point is' {
+    $neverCreated = Join-Path $script:TestDir 'does\not\exist\extensions\ms-python.python-2024.1.0'
+    Test-VSCodeAncestorChainSafe $neverCreated | Should -BeTrue
+  }
+}
+
+# Invoke-VSCodeNativeCommand is mocked away as the single seam in every
+# other test in this file - its own real behavior (the file-redirection
+# capture this function was rewritten to use, replacing the
+# Register-ObjectEvent-based capture flagged as a real PowerShell-5.1
+# host-crash risk - see this function's own FIX comment) is exercised
+# here for real, against a real child process, on whatever real Windows
+# box actually runs this suite. powershell.exe (not pwsh) is used as the
+# real child target specifically because it's always present under real
+# RTR's own runtime assumption (Windows PowerShell 5.1, no bundled pwsh
+# dependency) - same reasoning this project already applies elsewhere for
+# why the 5.1-specific bugs only ever surfaced via real hardware, not the
+# pwsh-7-bootstrapped test path.
+Describe 'Invoke-VSCodeNativeCommand (real, unmocked)' {
+  BeforeAll {
+    $script:RealPwshPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  }
+
+  It 'captures stdout and stderr SEPARATELY (not merged) and the real exit code, for a real child process' {
+    $result = Invoke-VSCodeNativeCommand -FilePath $script:RealPwshPath `
+      -ArgumentList @('-NoProfile', '-Command', '[Console]::Error.WriteLine(''err-marker''); Write-Output ''out-marker''; exit 3') `
+      -TimeoutSec 20
+    $result.ExitCode | Should -Be 3
+    $result.Stdout | Should -Match 'out-marker'
+    $result.Stdout | Should -Not -Match 'err-marker'
+    $result.Stderr | Should -Match 'err-marker'
+    $result.Stderr | Should -Not -Match 'out-marker'
+  }
+
+  It 'an argument containing spaces round-trips correctly through the outer cmd.exe quote-wrap' {
+    $result = Invoke-VSCodeNativeCommand -FilePath $script:RealPwshPath `
+      -ArgumentList @('-NoProfile', '-Command', 'Write-Output ''hello world with spaces''') `
+      -TimeoutSec 20
+    $result.ExitCode | Should -Be 0
+    $result.Stdout | Should -Match 'hello world with spaces'
+  }
+
+  It 'leaves no stray redirection temp files behind in $env:TEMP after a real run' {
+    $before = @(Get-ChildItem -Path $env:TEMP -Filter 'glow_vscode_*' -ErrorAction SilentlyContinue).Count
+    Invoke-VSCodeNativeCommand -FilePath $script:RealPwshPath -ArgumentList @('-NoProfile', '-Command', 'exit 0') -TimeoutSec 20 | Out-Null
+    $after = @(Get-ChildItem -Path $env:TEMP -Filter 'glow_vscode_*' -ErrorAction SilentlyContinue).Count
+    $after | Should -Be $before
   }
 }

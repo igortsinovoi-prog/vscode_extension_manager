@@ -342,7 +342,7 @@ Running the deployed script directly against a real machine (this is what
 RTR does under the hood - one base64-encoded JSON payload as the only arg):
 
 ```bash
-INPUT=$(printf '%s' '{"params":{"extension_id":"ms-python.python","version":"2024.1.0","extension_path":"/Users/jdoe/.vscode/extensions/ms-python.python-2024.5.0"},"dry_run":true}' | base64)
+INPUT=$(printf '%s' '{"params":{"extension_id":"ms-python.python","desired_version":"2024.1.0","extension_path":"/Users/jdoe/.vscode/extensions/ms-python.python-2024.5.0"},"dry_run":true}' | base64)
 sudo osascript -l JavaScript js_scripts/dist/set-vscode-extension-version.js "$INPUT"
 ```
 
@@ -379,7 +379,7 @@ ps_scripts/run_all_tests.sh --target windows --host <ip> --user <admin-user> --p
 Running the deployed script directly against a real machine:
 
 ```powershell
-$json = '{"params":{"extension_id":"ms-python.python","version":"2024.1.0","extension_path":"C:\\Users\\jdoe\\.vscode\\extensions\\ms-python.python-2024.5.0"},"dry_run":true}'
+$json = '{"params":{"extension_id":"ms-python.python","desired_version":"2024.1.0","extension_path":"C:\\Users\\jdoe\\.vscode\\extensions\\ms-python.python-2024.5.0"},"dry_run":true}'
 $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
 .\ps_scripts\dist\Set-VSCodeExtensionVersion.ps1 $b64
 ```

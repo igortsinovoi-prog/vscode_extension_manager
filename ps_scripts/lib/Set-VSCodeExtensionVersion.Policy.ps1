@@ -221,13 +221,22 @@ function Get-VSCodeRunOutcome {
   }
 
   if ($actionFailed) {
+    # UPGRADE_INCOMPLETE, not a script-local code: the CLI ran and failed
+    # with no more specific classification available - see
+    # glow-template's docs/reference/uniformity-conventions.md registered error-code list. $stderr is
+    # folded into Message (not a separate error-object field - the
+    # canonical envelope-level/target-level error shape is exactly
+    # {code, message}, no stderr key; the raw text still needs to reach
+    # the caller for diagnosis, so it goes into the message itself
+    # instead of being dropped).
+    $msg = 'code --install-extension failed'
+    if ($stderr) { $msg = "${msg}: $stderr" }
     return [PSCustomObject]@{
       Status  = 'failure'
       Changed = $false
       Error   = [PSCustomObject]@{
-        Code    = 'EXTENSION_VERSION_CHANGE_FAILED'
-        Message = 'code --install-extension/--upgrade-extension failed'
-        Stderr  = $stderr
+        Code    = 'UPGRADE_INCOMPLETE'
+        Message = $msg
       }
     }
   }

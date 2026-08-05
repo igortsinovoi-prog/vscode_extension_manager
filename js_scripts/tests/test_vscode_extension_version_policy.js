@@ -306,28 +306,22 @@ test('computeRunOutcome: set_version succeeds but the version is unchanged -> su
   );
 });
 
-test('computeRunOutcome: set_version fails -> failure, with stderr in the error', () => {
+test('computeRunOutcome: set_version fails -> failure, UPGRADE_INCOMPLETE, stderr folded into the message (canonical error object is {code, message} only)', () => {
   const decision = { action: 'set_version', installedVersion: '2024.1.0' };
   const actionResult = { attempted: true, ok: false, stderr: 'network error' };
-  assert.deepEqual(
-    computeRunOutcome(decision, actionResult, null, false),
-    {
-      status: 'failure',
-      changed: false,
-      error: {
-        code: 'EXTENSION_VERSION_CHANGE_FAILED',
-        message: 'code --install-extension/--upgrade-extension failed',
-        stderr: 'network error',
-      },
-    },
-  );
+  const outcome = computeRunOutcome(decision, actionResult, null, false);
+  assert.equal(outcome.status, 'failure');
+  assert.equal(outcome.changed, false);
+  assert.equal(outcome.error.code, 'UPGRADE_INCOMPLETE');
+  assert.ok(outcome.error.message.indexOf('network error') !== -1);
+  assert.ok(!Object.prototype.hasOwnProperty.call(outcome.error, 'stderr'));
 });
 
-test('computeRunOutcome: set_version fails with no stderr -> error.stderr defaults to empty string', () => {
+test('computeRunOutcome: set_version fails with no stderr -> message has no dangling separator', () => {
   const decision = { action: 'set_version', installedVersion: '2024.1.0' };
   const actionResult = { attempted: true, ok: false };
   const outcome = computeRunOutcome(decision, actionResult, null, false);
-  assert.equal(outcome.error.stderr, '');
+  assert.equal(outcome.error.message, 'code --install-extension failed');
 });
 
 test('computeRunOutcome: upgrade_to_latest succeeds and version changed -> success, changed', () => {

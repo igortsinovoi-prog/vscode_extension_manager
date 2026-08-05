@@ -39,7 +39,7 @@
 # Scenario 8: invalid version string -> real INVALID_PARAMS failure envelope.
 # Scenario 9: well-formed but nonexistent version -> real `code
 #             --install-extension` failure, captured as
-#             EXTENSION_VERSION_CHANGE_FAILED with real stderr, installed
+#             UPGRADE_INCOMPLETE with real cli_result.stderr, installed
 #             version left unchanged.
 # Scenario 10: extension_path omitted entirely -> MISSING_EXTENSION_PATH,
 #              run still proceeds (never aborts).
@@ -259,33 +259,85 @@ RTR_API_BASE="${FALCON_BASE:-https://api.us-2.crowdstrike.com}"
 RTR_PUT_NAME="set-vscode-extension-version-rtr-check.js"
 RTR_REMOTE_DIR="/tmp/glow_rwc_rtr"
 RTR_REMOTE_PATH="$RTR_REMOTE_DIR/$RTR_PUT_NAME"
+# RTR_SESSION_ID/RTR_TOKEN are also persisted to RTR_SESSION_FILE, not just
+# held as plain shell variables: every scenario body invokes run_dist_script
+# inside a `$(...)` command substitution (`result="$(run_script ...)"`),
+# which bash always forks a subshell for - a plain variable assigned inside
+# that subshell (by rtr_open_session) never propagates back to the parent
+# shell once the subshell exits. Without the file, every single call
+# re-does the entire mint-token/clear-put-file/upload/open-session/stage
+# sequence from scratch - each one still succeeds individually, so this is
+# easy to miss (no test failure, just needless extra API calls and real
+# seconds - confirmed real on a live windows-rtr run: every one of 18
+# scenarios re-staged from scratch, and the resulting per-call RTR overhead
+# was what pushed one otherwise-fast scenario's own bounded-time assertion
+# over its limit). `$$` is stable across subshells in bash (it's always the
+# top-level shell's PID, not the subshell's own), so every subshell in this
+# same run resolves the same file path. Ported from edge_extension_remove's
+# real_world_check_remove_edge_extension.sh, which already carries this fix
+# (confirmed clean on a real windows-rtr run there) - this project's own
+# copy never got it.
+RTR_SESSION_FILE="/tmp/glow_rwc_vscode_rtr_session_state_$$"
 RTR_SESSION_ID=""
 RTR_TOKEN=""
+
+# Hydrates RTR_TOKEN/RTR_SESSION_ID from RTR_SESSION_FILE if this
+# (sub)shell's own copies are currently empty - see the comment above.
+rtr_load_session() {
+  if [[ -z "$RTR_SESSION_ID" && -f "$RTR_SESSION_FILE" ]]; then
+    RTR_TOKEN="$(sed -n '1p' "$RTR_SESSION_FILE")"
+    RTR_SESSION_ID="$(sed -n '2p' "$RTR_SESSION_FILE")"
+  fi
+}
+
+rtr_save_session() {
+  printf '%s\n%s\n' "$RTR_TOKEN" "$RTR_SESSION_ID" > "$RTR_SESSION_FILE"
+}
 
 # Mints a bearer token from FALCON_CLIENT_ID/FALCON_CLIENT_SECRET - read
 # from the environment only. Never accept these as CLI flags: argv is
 # visible in shell history and to any other process on the machine via
 # `ps`, exactly the exposure rtr-put-file-guide.md itself warns against
 # ("pull it from Credential Manager/Keychain at runtime instead").
+# FIX (real-run): no `-f` on either curl call in this file anymore. `-f`
+# makes curl fail silently on an HTTP error response - exit nonzero AND
+# discard the response body entirely - which is exactly why a real,
+# reproducible-in-the-wild session-open failure showed up as "Error:
+# could not open an RTR session against device <AID>: " with NOTHING
+# after the colon: the real Falcon error body (which would have said
+# WHY - a policy issue, a transient device-offline state, rate limiting,
+# ...) was silently thrown away by curl itself before this script ever
+# saw it. None of the call sites here check curl's own exit code anyway
+# (they already check whether the field they parsed out of the response
+# is empty), so dropping `-f` costs nothing on the success path and
+# means a real failure's own response body actually reaches the error
+# message that already prints it.
 rtr_token() {
   if [[ -z "${FALCON_CLIENT_ID:-}" || -z "${FALCON_CLIENT_SECRET:-}" ]]; then
     echo "Error: --platform mac-rtr requires FALCON_CLIENT_ID and FALCON_CLIENT_SECRET in the environment" >&2
     exit 1
   fi
-  RTR_TOKEN="$(curl -sf -X POST "$RTR_API_BASE/oauth2/token" \
-    -d "client_id=$FALCON_CLIENT_ID" -d "client_secret=$FALCON_CLIENT_SECRET" \
-    | python3 -c 'import json, sys; print(json.load(sys.stdin).get("access_token") or "")')"
+  local resp
+  resp="$(curl -s -X POST "$RTR_API_BASE/oauth2/token" \
+    -d "client_id=$FALCON_CLIENT_ID" -d "client_secret=$FALCON_CLIENT_SECRET")"
+  RTR_TOKEN="$(printf '%s' "$resp" | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin).get("access_token") or "")
+except Exception:
+    print("")')"
   if [[ -z "$RTR_TOKEN" ]]; then
-    echo "Error: could not mint a Falcon API bearer token - check FALCON_CLIENT_ID/FALCON_CLIENT_SECRET" >&2
+    echo "Error: could not mint a Falcon API bearer token - check FALCON_CLIENT_ID/FALCON_CLIENT_SECRET. Response: $resp" >&2
     exit 1
   fi
 }
 
 # $1 = HTTP method, $2 = path (from the API root), remaining args passed
-# straight to curl (headers, -d body, -F form fields, ...).
+# straight to curl (headers, -d body, -F form fields, ...). See this
+# file's own FIX comment above rtr_token for why there is deliberately no
+# `-f` here.
 rtr_api() {
   local method="$1" path="$2"; shift 2
-  curl -sf -X "$method" "$RTR_API_BASE$path" -H "Authorization: Bearer $RTR_TOKEN" "$@"
+  curl -s -X "$method" "$RTR_API_BASE$path" -H "Authorization: Bearer $RTR_TOKEN" "$@"
 }
 
 # Clears any stale put-file already in the cloud inventory under this same
@@ -389,6 +441,7 @@ except Exception:
 # this one goes over the network to a real CrowdStrike session.
 rtr_run_dist_script() {
   local payload="$1"
+  rtr_load_session
   if [[ -z "$RTR_SESSION_ID" ]]; then
     echo "==> [mac-rtr] Minting Falcon API token" >&2
     rtr_token
@@ -423,6 +476,7 @@ rtr_run_dist_script() {
       echo "Error: [mac-rtr] put didn't stage the file at $RTR_REMOTE_PATH - stop before invoking" >&2
       exit 1
     fi
+    rtr_save_session
   fi
 
   local invoke_cmd resp out err
@@ -439,18 +493,26 @@ rtr_run_dist_script() {
   printf '%s' "$out"
 }
 
-# The mac-rtr override for cleanup_deployed_script - closes the real RTR
-# session (mirroring the guide's own step 5) and clears the put-file from
-# the cloud inventory, so a finished run doesn't leave either behind.
-# Guarded (never lets set -e propagate a failure here): this runs from
-# inside restore_original_state's EXIT trap, where the far more important
-# step is restoring the extension's own original install state, not
-# tidying up the RTR side.
+# The mac-rtr/windows-rtr override for cleanup_deployed_script - closes the
+# real RTR session (mirroring the guide's own step 5) and clears the
+# put-file from the cloud inventory, so a finished run doesn't leave either
+# behind. Guarded (never lets set -e propagate a failure here): this runs
+# from inside restore_original_state's EXIT trap, where the far more
+# important step is restoring the extension's own original install state,
+# not tidying up the RTR side.
 rtr_cleanup_deployed_script() {
+  # This runs from restore_original_state's EXIT trap in the TOP-LEVEL
+  # shell, which never itself ran rtr_open_session (every run_dist_script
+  # call happened inside a command-substitution subshell) - load the real
+  # session/token from RTR_SESSION_FILE rather than trusting this shell's
+  # own (always empty) copies, or the real session/put-file never actually
+  # get cleaned up.
+  rtr_load_session
   if [[ -n "$RTR_SESSION_ID" ]]; then
     rtr_api DELETE "/real-time-response/entities/sessions/v1?session_id=$RTR_SESSION_ID" >/dev/null 2>&1 || true
   fi
   rtr_clear_stale_put_file 2>/dev/null || true
+  rm -f "$RTR_SESSION_FILE" 2>/dev/null || true
 }
 
 # The windows-rtr override for run_dist_script (see the windows
@@ -467,6 +529,7 @@ rtr_cleanup_deployed_script() {
 # above is reused unchanged too (it only touches RTR_SESSION_ID/RTR_PUT_NAME).
 rtr_run_dist_script_windows() {
   local payload="$1"
+  rtr_load_session
   if [[ -z "$RTR_SESSION_ID" ]]; then
     echo "==> [windows-rtr] Minting Falcon API token" >&2
     rtr_token
@@ -497,6 +560,7 @@ rtr_run_dist_script_windows() {
       echo "Error: [windows-rtr] put didn't stage the file at $RTR_REMOTE_PATH - stop before invoking" >&2
       exit 1
     fi
+    rtr_save_session
   fi
 
   local invoke_cmd resp out err
@@ -632,7 +696,29 @@ case "$PLATFORM" in
         echo "Error: --platform mac-rtr requires --device-aid <AID>" >&2
         exit 1
       fi
-      run_dist_script() { rtr_run_dist_script "$1"; }
+      # A reused RTR session can still expire mid-run - a long real-world
+      # check with real install/wait cycles between calls leaves real
+      # multi-minute gaps with zero RTR traffic on that session, and a
+      # later call can come back with no cloud_request_id at all
+      # (session idle/expired server-side). rtr_send's own `exit 1` only
+      # kills the immediately-enclosing subshell (the `$(run_dist_script
+      # ...)` at the scenario call site), so a stale session shows up
+      # here as an empty response, not a crash - detect that and
+      # transparently retry once with a freshly-opened session rather
+      # than leaving every remaining scenario in the run failing for a
+      # reason that has nothing to do with the script under test.
+      run_dist_script() {
+        local out
+        out="$(rtr_run_dist_script "$1")"
+        if [[ -z "$out" ]]; then
+          echo "  [mac-rtr] empty response from a reused session - it may have expired; clearing and retrying once with a fresh session" >&2
+          rm -f "$RTR_SESSION_FILE" 2>/dev/null || true
+          RTR_SESSION_ID=""
+          RTR_TOKEN=""
+          out="$(rtr_run_dist_script "$1")"
+        fi
+        printf '%s' "$out"
+      }
       cleanup_deployed_script() { rtr_cleanup_deployed_script; }
     fi
     setup_symlink_scenario() {
@@ -652,11 +738,11 @@ case "$PLATFORM" in
       run_as_real_user cat "$SETTINGS_PATH" 2>/dev/null || true
     }
     # Scenario 16's own check that the deployed script's real on-disk
-    # backup (settings.json.rwcbak - see enableSignatureBypass's own
+    # backup (settings.json.glow-bak - see enableSignatureBypass's own
     # comment) never lingers after a normal run - it should only ever
     # exist transiently, for the duration of a single CLI call.
     settings_backup_file_exists() {
-      run_as_real_user test -f "${SETTINGS_PATH}.rwcbak"
+      run_as_real_user test -f "${SETTINGS_PATH}.glow-bak"
     }
     set_verify_signature_true() {
       run_as_real_user python3 -c '
@@ -1158,7 +1244,20 @@ PS
       # "DIST_SCRIPT: unbound variable" under set -u.
       DIST_SCRIPT="$LOCAL_DIST_FILE"
       build_dist() { "$ROOT_DIR/ps_scripts/build.sh" >&2; }
-      run_dist_script() { rtr_run_dist_script_windows "$1"; }
+      # Same expiry-retry wrapper as mac-rtr's own run_dist_script above -
+      # see that one's comment for why.
+      run_dist_script() {
+        local out
+        out="$(rtr_run_dist_script_windows "$1")"
+        if [[ -z "$out" ]]; then
+          echo "  [windows-rtr] empty response from a reused session - it may have expired; clearing and retrying once with a fresh session" >&2
+          rm -f "$RTR_SESSION_FILE" 2>/dev/null || true
+          RTR_SESSION_ID=""
+          RTR_TOKEN=""
+          out="$(rtr_run_dist_script_windows "$1")"
+        fi
+        printf '%s' "$out"
+      }
       cleanup_deployed_script() { rtr_cleanup_deployed_script; }
       # A Windows RTR session runs as SYSTEM, not the admin SSH account -
       # same IS_ROOT gating reason as the mac branch's own mac-rtr (see
@@ -1177,14 +1276,14 @@ if (Test-Path $settingsPath) { Get-Content $settingsPath -Raw } else { "" }
 PS
     }
     # Scenario 16's own check that the deployed script's real on-disk
-    # backup (settings.json.rwcbak - see
+    # backup (settings.json.glow-bak - see
     # Enable-VSCodeSignatureVerificationBypass's own comment) never
     # lingers after a normal run - it should only ever exist transiently,
     # for the duration of a single CLI call.
     settings_backup_file_exists() {
       local result
       result="$(remote_ps <<'PS' | tr -d '\r'
-Test-Path "$env:APPDATA\Code\User\settings.json.rwcbak"
+Test-Path "$env:APPDATA\Code\User\settings.json.glow-bak"
 PS
       )"
       [[ "$result" == "True" ]]
@@ -1630,7 +1729,7 @@ import base64, json, sys
 ext_id, version, ext_path, dry_run = sys.argv[1:5]
 params = {"extension_id": ext_id, "extension_path": ext_path}
 if version:
-    params["version"] = version
+    params["desired_version"] = version
 payload = {"params": params, "dry_run": dry_run == "true"}
 print(base64.b64encode(json.dumps(payload).encode()).decode())
 PY
@@ -1654,7 +1753,7 @@ if ext_id:
 if ext_path:
     params["extension_path"] = ext_path
 if version:
-    params["version"] = version
+    params["desired_version"] = version
 payload = {"params": params, "dry_run": dry_run == "true"}
 print(base64.b64encode(json.dumps(payload).encode()).decode())
 PY
@@ -1673,6 +1772,36 @@ nested_field() {
 import json, sys
 env, outer, inner = sys.argv[1], sys.argv[2], sys.argv[3]
 v = json.loads(env).get(outer) or {}
+print(v.get(inner))
+' "$1" "$2" "$3"
+}
+
+# Per-target fields (extension_id, action, cli_result, target_user,
+# user_resolution_note, installed_version_after, vscode_restarted, ...)
+# live inside targets[0], not at the envelope root - see
+# docs/reference/uniformity-conventions.md's upgrade-family scope/targets[]
+# convention in glow-template. status/changed/error/dry_run stay at the
+# envelope root (mirrored from the one target) and keep using field()/
+# nested_field() above unchanged. This script only ever produces exactly
+# one target (scope is always "anchor"), so targets[0] is always safe to
+# index directly.
+target_field() {
+  # $1 = JSON envelope, $2 = field name -> targets[0].<field>
+  python3 -c '
+import json, sys
+env, name = sys.argv[1], sys.argv[2]
+targets = json.loads(env).get("targets") or []
+print(targets[0].get(name) if targets else None)
+' "$1" "$2"
+}
+
+target_nested_field() {
+  # $1 = JSON envelope, $2 = outer field, $3 = inner field -> targets[0].<outer>.<inner>
+  python3 -c '
+import json, sys
+env, outer, inner = sys.argv[1], sys.argv[2], sys.argv[3]
+targets = json.loads(env).get("targets") or []
+v = (targets[0].get(outer) or {}) if targets else {}
 print(v.get(inner))
 ' "$1" "$2" "$3"
 }
@@ -1865,7 +1994,7 @@ check "extension is not installed before the run" "$(get_installed_version)" ""
 
 result="$(run_script "0.4.0" "false" "$USER_EXTENSION_PATH")"
 echo "  envelope: $result"
-check "action is not_installed" "$(field "$result" action)" "not_installed"
+check "action is not_installed" "$(target_field "$result" action)" "not_installed"
 check "status is skipped" "$(field "$result" status)" "skipped"
 check "changed is false" "$(field "$result" changed)" "False"
 check "extension is still not installed after the run" "$(get_installed_version)" ""
@@ -1883,7 +2012,7 @@ result="$(run_script "0.4.0" "false" "$USER_EXTENSION_PATH")"
 echo "  envelope: $result"
 check "status is success or skipped (already-correct edge case)" \
   "$(python3 -c "print('$(field "$result" status)' in ('success','skipped'))")" "True"
-check "envelope reports installed_version_after == 0.4.0" "$(field "$result" installed_version_after)" "0.4.0"
+check "envelope reports installed_version_after == 0.4.0" "$(target_field "$result" installed_version_after)" "0.4.0"
 check "code --list-extensions independently confirms version 0.4.0" "$(get_installed_version)" "0.4.0"
 
 fi
@@ -1895,10 +2024,10 @@ check "extension is at 0.4.0 before the run" "$(get_installed_version)" "0.4.0"
 
 result="$(run_script "" "false" "$USER_EXTENSION_PATH")"
 echo "  envelope: $result"
-check "action is upgrade_to_latest" "$(field "$result" action)" "upgrade_to_latest"
+check "action is upgrade_to_latest" "$(target_field "$result" action)" "upgrade_to_latest"
 check "status is success" "$(field "$result" status)" "success"
 check "changed is true" "$(field "$result" changed)" "True"
-check "envelope reports installed_version_after == $LATEST_VERSION" "$(field "$result" installed_version_after)" "$LATEST_VERSION"
+check "envelope reports installed_version_after == $LATEST_VERSION" "$(target_field "$result" installed_version_after)" "$LATEST_VERSION"
 check "code --list-extensions independently confirms version $LATEST_VERSION" "$(get_installed_version)" "$LATEST_VERSION"
 
 fi
@@ -1910,10 +2039,10 @@ check "extension is at 0.4.0 before the run" "$(get_installed_version)" "0.4.0"
 
 result="$(run_script "0.4.0" "false" "$USER_EXTENSION_PATH")"
 echo "  envelope: $result"
-check "action is already_correct_version" "$(field "$result" action)" "already_correct_version"
+check "action is already_correct_version" "$(target_field "$result" action)" "already_correct_version"
 check "status is skipped" "$(field "$result" status)" "skipped"
 check "changed is false" "$(field "$result" changed)" "False"
-check "cli_result is null (no CLI action taken)" "$(field "$result" cli_result)" "None"
+check "cli_result is null (no CLI action taken)" "$(target_field "$result" cli_result)" "None"
 check "extension is still at 0.4.0 after the run" "$(get_installed_version)" "0.4.0"
 
 fi
@@ -1923,9 +2052,9 @@ echo "=== Scenario 5a: extension_path names the real current user -> resolves an
 set_installed_version "0.4.0"
 result="$(run_script "" "false" "$USER_EXTENSION_PATH")"
 echo "  envelope: $result"
-check "target_user is $REAL_USER" "$(field "$result" target_user)" "$REAL_USER"
-check "$RAN_AS_ROOT_FIELD is false" "$(field "$result" "$RAN_AS_ROOT_FIELD")" "False"
-check "user_resolution_note is null" "$(field "$result" user_resolution_note)" "None"
+check "target_user is $REAL_USER" "$(target_field "$result" target_user)" "$REAL_USER"
+check "$RAN_AS_ROOT_FIELD is false" "$(target_field "$result" "$RAN_AS_ROOT_FIELD")" "False"
+check "user_resolution_note is null" "$(target_field "$result" user_resolution_note)" "None"
 check "code --list-extensions independently confirms version $LATEST_VERSION" "$(get_installed_version)" "$LATEST_VERSION"
 
 fi
@@ -1944,10 +2073,10 @@ check "extension is at 0.4.0 before the run" "$(get_installed_version)" "0.4.0"
 
 result="$(run_script "$LATEST_VERSION" "false" "$NO_SUCH_USER_PATH")"
 echo "  envelope: $result"
-check "target_user is glow_test_no_such_user" "$(field "$result" target_user)" "glow_test_no_such_user"
-check "$RAN_AS_ROOT_FIELD is true" "$(field "$result" "$RAN_AS_ROOT_FIELD")" "True"
+check "target_user is glow_test_no_such_user" "$(target_field "$result" target_user)" "glow_test_no_such_user"
+check "$RAN_AS_ROOT_FIELD is true" "$(target_field "$result" "$RAN_AS_ROOT_FIELD")" "True"
 check "user_resolution_note is EXTENSION_PATH_USER_NOT_FOUND" \
-  "$(field "$result" user_resolution_note)" "EXTENSION_PATH_USER_NOT_FOUND"
+  "$(target_field "$result" user_resolution_note)" "EXTENSION_PATH_USER_NOT_FOUND"
 if [[ "$IS_ROOT" == true ]]; then
   check "real user's installed version is untouched by the root-fallback run (only meaningful under sudo)" \
     "$(get_installed_version)" "0.4.0"
@@ -1965,10 +2094,10 @@ if setup_access_denied_profile_dir; then
   set_installed_version "0.4.0"
   result="$(run_script "$LATEST_VERSION" "false" "$ACCESS_DENIED_USER_PATH")"
   echo "  envelope: $result"
-  check "target_user is glow_test_locked_profile" "$(field "$result" target_user)" "glow_test_locked_profile"
-  check "$RAN_AS_ROOT_FIELD is true" "$(field "$result" "$RAN_AS_ROOT_FIELD")" "True"
+  check "target_user is glow_test_locked_profile" "$(target_field "$result" target_user)" "glow_test_locked_profile"
+  check "$RAN_AS_ROOT_FIELD is true" "$(target_field "$result" "$RAN_AS_ROOT_FIELD")" "True"
   check "user_resolution_note is EXTENSION_PATH_USER_PROFILE_ACCESS_DENIED (not EXTENSION_PATH_USER_NOT_FOUND - the profile genuinely exists)" \
-    "$(field "$result" user_resolution_note)" "EXTENSION_PATH_USER_PROFILE_ACCESS_DENIED"
+    "$(target_field "$result" user_resolution_note)" "EXTENSION_PATH_USER_PROFILE_ACCESS_DENIED"
   teardown_access_denied_profile_dir
 else
   skip "extension_path names a user whose profile directory exists but is access-denied" \
@@ -1984,7 +2113,7 @@ check "extension is at latest ($LATEST_VERSION) before the run" "$(get_installed
 
 result="$(run_script "0.4.0" "true" "$USER_EXTENSION_PATH")"
 echo "  envelope: $result"
-check "action is set_version" "$(field "$result" action)" "set_version"
+check "action is set_version" "$(target_field "$result" action)" "set_version"
 check "status is skipped" "$(field "$result" status)" "skipped"
 check "changed is false" "$(field "$result" changed)" "False"
 check "dry_run is true" "$(field "$result" dry_run)" "True"
@@ -2020,12 +2149,16 @@ check "extension is at 0.4.0 before the run" "$(get_installed_version)" "0.4.0"
 
 result="$(run_script "99.99.99" "false" "$USER_EXTENSION_PATH")"
 echo "  envelope: $result"
-check "action is set_version" "$(field "$result" action)" "set_version"
+check "action is set_version" "$(target_field "$result" action)" "set_version"
 check "status is failure" "$(field "$result" status)" "failure"
 check "changed is false" "$(field "$result" changed)" "False"
-check "error.code is EXTENSION_VERSION_CHANGE_FAILED" "$(nested_field "$result" error code)" "EXTENSION_VERSION_CHANGE_FAILED"
-check "error.stderr is non-empty (real captured CLI failure output)" \
-  "$(python3 -c 'import json,sys; print(bool((json.loads(sys.argv[1]).get("error") or {}).get("stderr")))' "$result")" "True"
+check "error.code is UPGRADE_INCOMPLETE" "$(nested_field "$result" error code)" "UPGRADE_INCOMPLETE"
+# Canonical envelope error is {code, message} only, no stderr key - the
+# raw CLI failure text lives in targets[0].cli_result.stderr instead (a
+# separate, still-real field) AND gets folded into error.message itself.
+cli_stderr_val="$(target_nested_field "$result" cli_result stderr)"
+check "cli_result.stderr is non-empty (real captured CLI failure output)" \
+  "$([[ -n "$cli_stderr_val" && "$cli_stderr_val" != "None" ]] && echo True || echo False)" "True"
 check "real installed version is unchanged (still 0.4.0)" "$(get_installed_version)" "0.4.0"
 
 fi
@@ -2035,15 +2168,15 @@ echo "=== Scenario 10: extension_path omitted entirely -> must not abort ==="
 set_installed_version "0.4.0"
 result="$(run_script_raw "$EXT_ID" "0.4.0" "" "false")"
 echo "  envelope: $result"
-check "target_user is null" "$(field "$result" target_user)" "None"
-check "$RAN_AS_ROOT_FIELD is true" "$(field "$result" "$RAN_AS_ROOT_FIELD")" "True"
-check "user_resolution_note is MISSING_EXTENSION_PATH" "$(field "$result" user_resolution_note)" "MISSING_EXTENSION_PATH"
+check "target_user is null" "$(target_field "$result" target_user)" "None"
+check "$RAN_AS_ROOT_FIELD is true" "$(target_field "$result" "$RAN_AS_ROOT_FIELD")" "True"
+check "user_resolution_note is MISSING_EXTENSION_PATH" "$(target_field "$result" user_resolution_note)" "MISSING_EXTENSION_PATH"
 # The isolated fallback identity (root's HOME=/var/root on mac; SYSTEM's own
 # profile on Windows) has no VS Code extensions of its own, regardless of
 # what $REAL_USER has installed - so this genuinely reports not_installed,
 # not already_correct_version.
 check "run still proceeds: action is not_installed (isolated identity has no extensions installed)" \
-  "$(field "$result" action)" "not_installed"
+  "$(target_field "$result" action)" "not_installed"
 check "run still proceeds: status is skipped (not failure)" "$(field "$result" status)" "skipped"
 
 fi
@@ -2052,9 +2185,9 @@ echo
 echo "=== Scenario 11: malformed extension_path -> INVALID_EXTENSION_PATH ==="
 result="$(run_script "0.4.0" "false" "/tmp/not/a/valid/vscode/path")"
 echo "  envelope: $result"
-check "user_resolution_note is INVALID_EXTENSION_PATH" "$(field "$result" user_resolution_note)" "INVALID_EXTENSION_PATH"
-check "target_user is null" "$(field "$result" target_user)" "None"
-check "$RAN_AS_ROOT_FIELD is true" "$(field "$result" "$RAN_AS_ROOT_FIELD")" "True"
+check "user_resolution_note is INVALID_EXTENSION_PATH" "$(target_field "$result" user_resolution_note)" "INVALID_EXTENSION_PATH"
+check "target_user is null" "$(target_field "$result" target_user)" "None"
+check "$RAN_AS_ROOT_FIELD is true" "$(target_field "$result" "$RAN_AS_ROOT_FIELD")" "True"
 check "run still proceeds: status is skipped (not failure)" "$(field "$result" status)" "skipped"
 
 fi
@@ -2063,9 +2196,9 @@ echo
 echo "=== Scenario 12: extension_path names a different extension's directory -> EXTENSION_PATH_ID_MISMATCH ==="
 result="$(run_script "0.4.0" "false" "$MISMATCHED_ID_PATH")"
 echo "  envelope: $result"
-check "user_resolution_note is EXTENSION_PATH_ID_MISMATCH" "$(field "$result" user_resolution_note)" "EXTENSION_PATH_ID_MISMATCH"
-check "target_user is null" "$(field "$result" target_user)" "None"
-check "$RAN_AS_ROOT_FIELD is true" "$(field "$result" "$RAN_AS_ROOT_FIELD")" "True"
+check "user_resolution_note is EXTENSION_PATH_ID_MISMATCH" "$(target_field "$result" user_resolution_note)" "EXTENSION_PATH_ID_MISMATCH"
+check "target_user is null" "$(target_field "$result" target_user)" "None"
+check "$RAN_AS_ROOT_FIELD is true" "$(target_field "$result" "$RAN_AS_ROOT_FIELD")" "True"
 check "run still proceeds: status is skipped (not failure)" "$(field "$result" status)" "skipped"
 
 fi
@@ -2078,10 +2211,10 @@ check "extension is at 0.4.0 before the run" "$(get_installed_version)" "0.4.0"
 EXT_ID_UPPER="$(echo "$EXT_ID" | tr '[:lower:]' '[:upper:]')"
 result="$(run_script_raw "$EXT_ID_UPPER" "0.4.0" "$USER_EXTENSION_PATH" "false")"
 echo "  envelope: $result"
-check "action is already_correct_version (matched despite case difference)" "$(field "$result" action)" "already_correct_version"
+check "action is already_correct_version (matched despite case difference)" "$(target_field "$result" action)" "already_correct_version"
 check "status is skipped" "$(field "$result" status)" "skipped"
-check "target_user is $REAL_USER (path parsing also case-insensitive)" "$(field "$result" target_user)" "$REAL_USER"
-check "user_resolution_note is null" "$(field "$result" user_resolution_note)" "None"
+check "target_user is $REAL_USER (path parsing also case-insensitive)" "$(target_field "$result" target_user)" "$REAL_USER"
+check "user_resolution_note is null" "$(target_field "$result" user_resolution_note)" "None"
 
 fi
 if scenario_enabled "14"; then
@@ -2091,9 +2224,9 @@ setup_symlink_scenario
 
 result="$(run_script "0.4.0" "false" "$SYMLINK_PATH")"
 echo "  envelope: $result"
-check "user_resolution_note is EXTENSION_PATH_UNSAFE" "$(field "$result" user_resolution_note)" "EXTENSION_PATH_UNSAFE"
-check "target_user is $REAL_USER (parsed from path shape, kept for diagnostics)" "$(field "$result" target_user)" "$REAL_USER"
-check "$RAN_AS_ROOT_FIELD is true (unsafe path falls back off the target user, not the symlink target)" "$(field "$result" "$RAN_AS_ROOT_FIELD")" "True"
+check "user_resolution_note is EXTENSION_PATH_UNSAFE" "$(target_field "$result" user_resolution_note)" "EXTENSION_PATH_UNSAFE"
+check "target_user is $REAL_USER (parsed from path shape, kept for diagnostics)" "$(target_field "$result" target_user)" "$REAL_USER"
+check "$RAN_AS_ROOT_FIELD is true (unsafe path falls back off the target user, not the symlink target)" "$(target_field "$result" "$RAN_AS_ROOT_FIELD")" "True"
 check "run still proceeds: status is skipped (not failure)" "$(field "$result" status)" "skipped"
 
 teardown_symlink_scenario
@@ -2114,7 +2247,7 @@ if real_gui_session_available; then
   echo "  ==> Pinning $EXT_ID to 0.4.0 via our own deployed script"
   result="$(run_script "0.4.0" "false" "$USER_EXTENSION_PATH")"
   echo "  envelope: $result"
-  check "our script successfully pinned to 0.4.0" "$(field "$result" installed_version_after)" "0.4.0"
+  check "our script successfully pinned to 0.4.0" "$(target_field "$result" installed_version_after)" "0.4.0"
   check "extension is at 0.4.0 before triggering a real VS Code session" "$(get_installed_version)" "0.4.0"
 
   # Control extension: old version too, but explicitly UNPINNED. Without
@@ -2274,7 +2407,7 @@ echo "  Now running our own deployed script for the same extension/version..."
 result="$(run_script "$SIGNATURE_TEST_VERSION" "false" "$USER_EXTENSION_PATH")"
 echo "  envelope: $result"
 check "our script succeeds despite verification being explicitly on" "$(field "$result" status)" "success"
-check "envelope reports installed_version_after == $SIGNATURE_TEST_VERSION" "$(field "$result" installed_version_after)" "$SIGNATURE_TEST_VERSION"
+check "envelope reports installed_version_after == $SIGNATURE_TEST_VERSION" "$(target_field "$result" installed_version_after)" "$SIGNATURE_TEST_VERSION"
 check "code --list-extensions independently confirms version $SIGNATURE_TEST_VERSION" "$(get_installed_version)" "$SIGNATURE_TEST_VERSION"
 check "deployed script's own on-disk settings.json backup does not linger after a normal run" \
   "$(settings_backup_file_exists && echo present || echo absent)" "absent"
@@ -2308,10 +2441,10 @@ if [[ "$session_ready" == true ]]; then
   echo "  ==> Running our deployed script to change $EXT_ID's version (should trigger a restart)"
   result="$(run_script "" "false" "$USER_EXTENSION_PATH")"
   echo "  envelope: $result"
-  check "action is upgrade_to_latest" "$(field "$result" action)" "upgrade_to_latest"
+  check "action is upgrade_to_latest" "$(target_field "$result" action)" "upgrade_to_latest"
   check "status is success" "$(field "$result" status)" "success"
   check "changed is true" "$(field "$result" changed)" "True"
-  check "envelope reports vscode_restarted true" "$(field "$result" vscode_restarted)" "True"
+  check "envelope reports vscode_restarted true" "$(target_field "$result" vscode_restarted)" "True"
 
   echo "  ==> Polling for VS Code's process to actually cycle to a new pid (up to 30s)..."
   waited=0
@@ -2359,7 +2492,7 @@ else
   echo "  envelope: $result"
   check "status is success" "$(field "$result" status)" "success"
   check "changed is true" "$(field "$result" changed)" "True"
-  check "envelope reports vscode_restarted false" "$(field "$result" vscode_restarted)" "False"
+  check "envelope reports vscode_restarted false" "$(target_field "$result" vscode_restarted)" "False"
   check "VS Code was not launched as a side effect" \
     "$(vscode_gui_session_running && echo running || echo not_running)" "not_running"
 fi
@@ -2383,7 +2516,7 @@ if stub_code_binary; then
   check "call returns within a bounded time, not hung forever" \
     "$([[ $elapsed -lt 60 ]] && echo bounded || echo unbounded)" "bounded"
   check "status is failure" "$(field "$result" status)" "failure"
-  check "error.code is LIST_EXTENSIONS_FAILED" "$(nested_field "$result" error code)" "LIST_EXTENSIONS_FAILED"
+  check "error.code is UPGRADE_INCOMPLETE" "$(nested_field "$result" error code)" "UPGRADE_INCOMPLETE"
   restore_code_binary
   echo "  ==> Real code binary/code.cmd restored"
 else

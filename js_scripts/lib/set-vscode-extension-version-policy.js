@@ -149,14 +149,19 @@ function computeRunOutcome(decision, actionResult, installedVersionAfter, dryRun
   }
 
   if (actionFailed) {
+    // UPGRADE_INCOMPLETE, not a script-local code: the CLI ran and failed
+    // with no more specific classification available - see
+    // glow-template docs/reference/uniformity-conventions.md's registered
+    // error-code list. Canonical error shape is {code, message} only, no
+    // stderr key - the raw text still needs to reach the caller, so it's
+    // folded into the message instead of dropped.
+    var stderrText = actionResult.stderr || '';
+    var msg = 'code --install-extension failed';
+    if (stderrText) msg += ': ' + stderrText;
     return {
       status: 'failure',
       changed: false,
-      error: {
-        code:    'EXTENSION_VERSION_CHANGE_FAILED',
-        message: 'code --install-extension/--upgrade-extension failed',
-        stderr:  actionResult.stderr || '',
-      },
+      error: { code: 'UPGRADE_INCOMPLETE', message: msg },
     };
   }
   if (decision.action === 'not_installed' || decision.action === 'already_correct_version') {
